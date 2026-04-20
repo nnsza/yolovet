@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Build / packaging artifacts
+/software_/
+/embedded_tools_build/
+/embedded_tools_spec/
+
+# Runtime-generated data
+/train_*/
+/runs/
+/labels/
+/images/
+/images2/
+/image3/
+
+# Local environments and caches
+/.vscode/
+/.idea/
+/.DS_Store
+Thumbs.db
+
+# Optional large model/data files (keep source repo lean)
+*.pt
+*.onnx
+*.zip
+*.7z
