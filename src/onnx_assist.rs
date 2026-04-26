@@ -14,7 +14,8 @@ const INPUT_SIZE: u32 = 640;
 
 /// Keep default close to Ultralytics predict default behavior.
 pub const ASSIST_ONNX_CONF: f32 = 0.25;
-const ASSIST_ONNX_IOU: f32 = 0.7;
+/// Rust 侧 NMS 默认 IoU（与 `nms=False` 导出配套）；`nms=True` 时 ONNX 已含 NMS，此值不生效。
+pub const ASSIST_ONNX_IOU: f32 = 0.7;
 
 #[derive(Clone, Debug)]
 pub struct AssistDetection {
@@ -222,6 +223,48 @@ fn parse_nms_output(
 }
 
 #[inline]
+/// 同类框按置信度排序后做 greedy NMS；`iou_nms` 为抑制阈值（两框 IoU 大于则去掉分低的）。
+fn classwise_nms_detections(mut candidates: Vec<AssistDetection>, iou_nms: f32) -> Vec<AssistDetection> {
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+    candidates.sort_by(|a, b| {
+        b.conf
+            .partial_cmp(&a.conf)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.model_class_id.cmp(&b.model_class_id))
+    });
+    let mut keep = Vec::<AssistDetection>::new();
+    let mut removed = vec![false; candidates.len()];
+    for i in 0..candidates.len() {
+        if removed[i] {
+            continue;
+        }
+        let cur = candidates[i].clone();
+        let cur_box = (cur.min_x, cur.min_y, cur.max_x, cur.max_y);
+        keep.push(cur.clone());
+        for j in (i + 1)..candidates.len() {
+            if removed[j] {
+                continue;
+            }
+            if candidates[j].model_class_id != cur.model_class_id {
+                continue;
+            }
+            let other = (
+                candidates[j].min_x,
+                candidates[j].min_y,
+                candidates[j].max_x,
+                candidates[j].max_y,
+            );
+            if iou_xyxy(&cur_box, &other) > iou_nms {
+                removed[j] = true;
+            }
+        }
+    }
+    keep
+}
+
+#[inline]
 fn iou_xyxy(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32)) -> f32 {
     let ix1 = a.0.max(b.0);
     let iy1 = a.1.max(b.1);
@@ -244,6 +287,7 @@ fn parse_raw_output_with_nms(
     shape: &[i64],
     data: &[f32],
     conf_min: f32,
+    iou_nms: f32,
     w0: u32,
     h0: u32,
     gain: f32,
@@ -251,11 +295,12 @@ fn parse_raw_output_with_nms(
     pad_y: f32,
 ) -> Option<Vec<AssistDetection>> {
     let dims: Vec<usize> = shape.iter().map(|&d| d.max(0) as usize).collect();
+    // Ultralytics 原始输出通道 = 4(xywh) + nc；单类别时 nc=1 → 共 5 通道，此前要求 >=6 会导致单类模型永远无法解析。
     let (channels, n, row_layout) = match dims.as_slice() {
-        [_, c, n] if *c >= 6 => (*c, *n, true),
-        [c, n] if *c >= 6 => (*c, *n, true),
-        [_, n, c] if *c >= 6 => (*c, *n, false),
-        [n, c] if *c >= 6 => (*c, *n, false),
+        [_, c, n] if *c >= 5 => (*c, *n, true),
+        [c, n] if *c >= 5 => (*c, *n, true),
+        [_, n, c] if *c >= 5 => (*c, *n, false),
+        [n, c] if *c >= 5 => (*c, *n, false),
         _ => return None,
     };
     if channels.saturating_mul(n) > data.len() {
@@ -326,47 +371,14 @@ fn parse_raw_output_with_nms(
         return Some(Vec::new());
     }
 
-    // Class-wise NMS, close to Ultralytics default behavior.
-    candidates.sort_by(|a, b| {
-        b.conf
-            .partial_cmp(&a.conf)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.model_class_id.cmp(&b.model_class_id))
-    });
-    let mut keep = Vec::<AssistDetection>::new();
-    let mut removed = vec![false; candidates.len()];
-    for i in 0..candidates.len() {
-        if removed[i] {
-            continue;
-        }
-        let cur = candidates[i].clone();
-        let cur_box = (cur.min_x, cur.min_y, cur.max_x, cur.max_y);
-        keep.push(cur.clone());
-        for j in (i + 1)..candidates.len() {
-            if removed[j] {
-                continue;
-            }
-            if candidates[j].model_class_id != cur.model_class_id {
-                continue;
-            }
-            let other = (
-                candidates[j].min_x,
-                candidates[j].min_y,
-                candidates[j].max_x,
-                candidates[j].max_y,
-            );
-            if iou_xyxy(&cur_box, &other) > ASSIST_ONNX_IOU {
-                removed[j] = true;
-            }
-        }
-    }
-    Some(keep)
+    Some(classwise_nms_detections(candidates, iou_nms))
 }
 
 fn parse_output_auto(
     shape: &[i64],
     data: &[f32],
     conf_min: f32,
+    iou_nms: f32,
     w0: u32,
     h0: u32,
     gain: f32,
@@ -374,9 +386,12 @@ fn parse_output_auto(
     pad_y: f32,
 ) -> Result<Vec<AssistDetection>, String> {
     if let Some(v) = parse_nms_output(shape, data, conf_min, w0, h0, gain, pad_x, pad_y) {
-        return Ok(v);
+        // nms=True 导出已在图内做 NMS；再用用户 IoU 做一轮，滑块对两种导出均生效。
+        return Ok(classwise_nms_detections(v, iou_nms));
     }
-    if let Some(v) = parse_raw_output_with_nms(shape, data, conf_min, w0, h0, gain, pad_x, pad_y) {
+    if let Some(v) =
+        parse_raw_output_with_nms(shape, data, conf_min, iou_nms, w0, h0, gain, pad_x, pad_y)
+    {
         return Ok(v);
     }
     let dims: Vec<usize> = shape.iter().map(|&d| d.max(0) as usize).collect();
@@ -389,12 +404,25 @@ pub fn predict_with_session(
     session: &mut Session,
     image_path: &Path,
     conf_min: f32,
+    iou_nms: f32,
 ) -> Result<Vec<AssistDetection>, String> {
     let rgba = image::open(image_path)
         .map_err(|e| format!("打开图像失败: {e}"))?
         .to_rgba8();
+    predict_with_session_rgba(session, &rgba, conf_min, iou_nms)
+}
+
+/// 与 [`predict_with_session`] 相同推理，但输入为内存图（如视频逐帧：磁盘 jpg 尚未写出时）。
+pub fn predict_with_session_rgba(
+    session: &mut Session,
+    rgba: &RgbaImage,
+    conf_min: f32,
+    iou_nms: f32,
+) -> Result<Vec<AssistDetection>, String> {
+    let conf_min = conf_min.clamp(0.0, 1.0);
+    let iou_nms = iou_nms.clamp(0.0, 1.0);
     let (w0, h0) = rgba.dimensions();
-    let (tensor, gain, pad_x, pad_y) = letterbox_nchw(&rgba)?;
+    let (tensor, gain, pad_x, pad_y) = letterbox_nchw(rgba)?;
     let input_name = session
         .inputs()
         .first()
@@ -414,10 +442,23 @@ pub fn predict_with_session(
         .run(ort::inputs![input_name.as_str() => input_view])
         .map_err(|e| format!("ONNX 推理失败: {e:?}"))?;
 
-    let out0 = &outputs[0];
-    let (shape, data) = out0
-        .try_extract_tensor::<f32>()
-        .map_err(|e| format!("读取输出张量失败: {e:?}"))?;
+    if outputs.len() == 0 {
+        return Err("模型推理无输出".to_string());
+    }
 
-    parse_output_auto(shape, data, conf_min, w0, h0, gain, pad_x, pad_y)
+    let mut last_err = String::from("无法解析任何输出张量");
+    for (i, (_name, out0)) in outputs.iter().enumerate() {
+        let (shape, data) = match out0.try_extract_tensor::<f32>() {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = format!("输出 #{i} 无法作为 f32 张量读取: {e:?}");
+                continue;
+            }
+        };
+        match parse_output_auto(shape, data, conf_min, iou_nms, w0, h0, gain, pad_x, pad_y) {
+            Ok(dets) => return Ok(dets),
+            Err(e) => last_err = format!("输出 #{i}: {e}"),
+        }
+    }
+    Err(last_err)
 }

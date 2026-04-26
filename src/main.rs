@@ -4,15 +4,15 @@ mod onnx_assist;
 
 use egui::{
     widgets::color_picker::{color_picker_color32, show_color, show_color_at, Alpha},
-    Align2, Area, CollapsingHeader, Color32, ComboBox, Context, CursorIcon, FontFamily, Frame, Id,
+    Align, Align2, Area, Color32, ComboBox, Context, CursorIcon, FontFamily, FontId, Frame, Id,
     Key, Label, Order, PointerButton, Pos2, Rect, Response, RichText, Sense, Shape, Stroke, Ui,
     UiKind, Vec2, WidgetInfo, WidgetType,
 };
-use image::{GenericImageView, RgbaImage};
+use image::{DynamicImage, GenericImageView, RgbaImage};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -65,7 +65,7 @@ struct AssistPred {
 /// 交换类别 id 时的临时标记（不会与真实类别数冲突）。
 const CLASS_SWAP_SENTINEL: usize = usize::MAX - 2;
 
-/// 与 `image_root` 同级：按行记录类别名；第 1 条非注释行为索引 0，顺次对应 YOLO 标签中的 class 列。
+/// 与 `image_root` 同级、按行记录类别名。图片集固定为 `class_log.txt`；多路视频同目录时用 `class_log_{视频主名}.txt` 区分。第 1 条非注释行对应类别索引 0。
 const CLASS_LOG_FILENAME: &str = "class_log.txt";
 
 fn class_log_file_header() -> &'static str {
@@ -120,21 +120,119 @@ fn status_chip(ui: &mut Ui, text: &str, tint: Color32) {
         });
 }
 
-fn metric_card(ui: &mut Ui, label: &str, value: impl Into<String>, detail: impl Into<String>, tint: Color32) {
-    app_card(theme::SURFACE_SOFT).show(ui, |ui| {
-        ui.set_min_height(68.0);
-        ui.vertical(|ui| {
-            ui.label(RichText::new(label).small().color(theme::TEXT_MUTED));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(value.into())
-                    .size(21.0)
-                    .strong()
-                    .color(theme::TEXT),
-            );
-            ui.label(RichText::new(detail.into()).small().color(tint));
+fn compact_metric_tile(ui: &mut Ui, width: f32, label: &str, value: &str, tint: Color32) {
+    let w = width.max(1.0);
+    Frame::default()
+        .fill(color_alpha(tint, 20))
+        .inner_margin(egui::Margin::symmetric(4.0, 3.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(Stroke::new(1.0, color_alpha(tint, 90)))
+        .show(ui, |ui| {
+            // 仅设 min 时内容会把芯片撑出均分格，与下方「打开当前路径」定宽行不对齐
+            ui.set_min_width(w);
+            ui.set_max_width(w);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(RichText::new(label).size(10.0).color(theme::TEXT_MUTED));
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center)
+                        .with_main_align(egui::Align::Min)
+                        .with_main_justify(true),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(value)
+                                    .size(10.5)
+                                    .strong()
+                                    .color(tint),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+            });
         });
-    });
+}
+
+fn training_backend_card(
+    ui: &Ui,
+    rect: Rect,
+    response: &Response,
+    id: Id,
+    title: &str,
+    subtitle: &str,
+    accent: Color32,
+    selected: bool,
+) {
+    let hover = ui
+        .ctx()
+        .animate_bool_responsive(id.with("hover"), response.hovered());
+    let selected_t = ui
+        .ctx()
+        .animate_bool_responsive(id.with("selected"), selected);
+    let down = ui.ctx().animate_bool_responsive(
+        id.with("down"),
+        response.is_pointer_button_down_on(),
+    );
+    if hover > 0.001 || selected_t > 0.001 || down > 0.001 {
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter();
+    let draw_rect = rect.translate(Vec2::new(0.0, down * 1.0));
+    painter.rect_filled(
+        draw_rect.expand(1.5 + hover * 1.2 + selected_t * 1.6),
+        10.0,
+        color_alpha(accent, (8.0 + hover * 12.0 + selected_t * 24.0) as u8),
+    );
+    painter.rect_filled(
+        draw_rect,
+        9.0,
+        if selected {
+            Color32::from_rgb(35, 47, 56)
+        } else {
+            Color32::from_rgb(28, 34, 43)
+        },
+    );
+    painter.rect_stroke(
+        draw_rect,
+        9.0,
+        Stroke::new(
+            1.0 + hover * 0.3 + selected_t * 0.55,
+            color_alpha(
+                if selected { accent } else { theme::BORDER_SUBTLE },
+                (if selected { 170.0 } else { 132.0 } + hover * 24.0) as u8,
+            ),
+        ),
+    );
+    let dot = Pos2::new(draw_rect.left() + 13.0, draw_rect.center().y);
+    painter.circle_filled(
+        dot,
+        4.3 + selected_t * 0.8,
+        if selected {
+            color_alpha(accent, 220)
+        } else {
+            color_alpha(theme::TEXT_MUTED, 96)
+        },
+    );
+    painter.text(
+        Pos2::new(draw_rect.left() + 24.0, draw_rect.top() + 12.0),
+        Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(13.5),
+        theme::TEXT,
+    );
+    painter.text(
+        Pos2::new(draw_rect.left() + 24.0, draw_rect.bottom() - 12.0),
+        Align2::LEFT_CENTER,
+        subtitle,
+        egui::FontId::proportional(10.5),
+        if selected {
+            color_alpha(accent, 230)
+        } else {
+            theme::TEXT_MUTED
+        },
+    );
 }
 
 fn section_accordion<R>(
@@ -183,6 +281,57 @@ fn section_accordion<R>(
     let header_resp = ui
         .interact(header_rect, header_id, Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
+
+    // 悬停判定：interact + 卡片响应 + 本层矩形命中（避免子控件挡掉 hover 导致特效不触发）。
+    let header_hovered = header_resp.hovered()
+        || header_inner.response.hovered()
+        || ui
+            .ctx()
+            .rect_contains_pointer(ui.layer_id(), header_rect);
+
+    // 悬停光效：平滑渐入 + 轻微脉冲；过渡结束后 egui 默认不再 request_repaint，时间动画会停住，故在显式播放时持续请求重绘。
+    let hover_strength = ui.ctx().animate_bool_responsive(
+        header_id.with("accordion_header_hover_fx"),
+        header_hovered,
+    );
+    if hover_strength > 0.001 {
+        let time = ui.input(|i| i.time as f32);
+        let pulse = (time * 3.1).sin() * 0.5 + 0.5;
+        let g = hover_strength * (0.62 + 0.38 * pulse);
+        let painter = ui.painter();
+        let rr = 14.0_f32;
+        let halo_a = (g * (40.0 + pulse * 85.0)).clamp(0.0, 255.0) as u8;
+        painter.rect_stroke(
+            header_rect.expand(2.2 + pulse * 2.0),
+            rr + 2.0,
+            Stroke::new(0.9 + g * 1.1, color_alpha(accent, halo_a)),
+        );
+        let rim_a = (g * (175.0 + pulse * 65.0)).clamp(0.0, 255.0) as u8;
+        painter.rect_stroke(
+            header_rect,
+            rr,
+            Stroke::new(1.15 + g * (0.95 + pulse * 0.45), color_alpha(accent, rim_a)),
+        );
+        let sweep_w = (header_rect.width() * (0.22 + pulse * 0.18)).clamp(28.0, 120.0);
+        let x0 = header_rect.left()
+            - sweep_w
+            + (time * 38.0).rem_euclid(header_rect.width() + sweep_w * 1.4);
+        let sheen = Rect::from_min_max(
+            Pos2::new(x0, header_rect.top() + 4.0),
+            Pos2::new(x0 + sweep_w * 0.55, header_rect.bottom() - 4.0),
+        )
+        .intersect(header_rect);
+        if sheen.width() > 2.0 && sheen.height() > 2.0 {
+            painter.rect_filled(
+                sheen,
+                6.0,
+                color_alpha(Color32::WHITE, (g * (18.0 + pulse * 16.0)) as u8),
+            );
+        }
+        // animate_bool 仅在 0↔1 过渡期内 request_repaint；脉冲/扫光依赖 time，需持续重绘。
+        ui.ctx().request_repaint();
+    }
+
     if header_resp.clicked() {
         if is_open {
             *open_section = None;
@@ -256,6 +405,8 @@ const EDGE_HOVER_THICK_EXTRA: f32 = 6.0;
 const STROKE_ENDPOINT_INSET: f32 = 5.0;
 const CROSSHAIR_DASH: f32 = 6.0;
 const CROSSHAIR_GAP: f32 = 5.0;
+/// 柔性外接（E/F）与拉新框（R）时，跟随指针的十字虚线线宽（屏幕像素）。
+const CROSSHAIR_STROKE: f32 = 2.85;
 
 #[inline]
 fn dist_point_segment_2d(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -363,6 +514,16 @@ impl Bbox {
 
 /// 与已有标注 IoU 不低于此值时，采纳辅助框会跳过并保留原框（轴对齐框标准 IoU）。
 const ASSIST_ADOPT_DUP_IOU: f32 = 0.9;
+/// 画布缩放 ≤ 此比例（相对适应窗口）时进入环轨相册：已标注图环列、主图外拖动旋转（带惯性）。
+const CAROUSEL_RING_ZOOM_MAX: f32 = 0.4;
+
+/// 环轨相册浏览分组：已存在非空标签行的图 / 尚未标注的图。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum CarouselRingPool {
+    #[default]
+    Annotated,
+    Unannotated,
+}
 
 #[inline]
 fn bbox_iou(a: &Bbox, b: &Bbox) -> f32 {
@@ -389,6 +550,27 @@ fn bbox_iou(a: &Bbox, b: &Bbox) -> f32 {
 #[inline]
 fn assist_class_mask_allows(mask: &[bool], model_class_id: usize) -> bool {
     mask.get(model_class_id).copied().unwrap_or(true)
+}
+
+/// ONNX 采纳：按模型类别 id 得到与辅助显示一致的名称（通常为 `unknown_{id}`），在列表中按**名称**查找；
+/// 找不到则在**末尾**新建，不占用已有索引，避免与手动类别混在同一 id 上。
+fn dataset_index_for_onnx_adopt_name(
+    classes_acc: &mut Vec<String>,
+    model_class_id: usize,
+    assist_names: &[String],
+) -> usize {
+    let name = assist_names
+        .get(model_class_id)
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("unknown_{}", model_class_id));
+    if let Some(i) = classes_acc.iter().position(|s| s == &name) {
+        return i;
+    }
+    let i = classes_acc.len();
+    classes_acc.push(name);
+    i
 }
 
 fn build_adopt_candidates(
@@ -451,8 +633,8 @@ struct GlobalAdoptSummary {
     infer_failed: usize,
     total_added: usize,
     total_skipped_iou: usize,
-    max_class_id: usize,
-    had_any_box: bool,
+    /// 全局采纳过程中按 ONNX 名称在末尾追加类别后的完整 `class_log` 顺序（前缀与采纳前一致）。
+    classes_after: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -857,15 +1039,32 @@ fn detect_conda_env_paths() -> Vec<String> {
     Vec::new()
 }
 
-fn try_load_chinese_font(ctx: &Context) {
-    let candidates = [
+/// 加载中文字体与 **Times New Roman**（`TNR_Brand` 族，专用于顶栏 `YoloVet` 品牌名）。
+/// 若系统存在 `C:\Windows\Fonts\times.ttf` 等路径则返回 `true`，否则回退为默认无衬线。
+fn setup_app_fonts(ctx: &Context) -> bool {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut tnr_ready = false;
+    for path in [r"C:\Windows\Fonts\times.ttf", r"C:\Windows\FONTS\times.ttf"] {
+        if let Ok(bytes) = fs::read(path) {
+            fonts.font_data.insert(
+                "app_tnr".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            fonts
+                .families
+                .entry(FontFamily::Name("TNR_Brand".into()))
+                .or_default()
+                .push("app_tnr".into());
+            tnr_ready = true;
+            break;
+        }
+    }
+    for path in [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyhbd.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
-    ];
-    for path in candidates {
+    ] {
         if let Ok(bytes) = fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
             fonts.font_data.insert(
                 "zh_ui".into(),
                 egui::FontData::from_owned(bytes).into(),
@@ -876,10 +1075,11 @@ fn try_load_chinese_font(ctx: &Context) {
             if let Some(v) = fonts.families.get_mut(&FontFamily::Monospace) {
                 v.push("zh_ui".into());
             }
-            ctx.set_fonts(fonts);
             break;
         }
     }
+    ctx.set_fonts(fonts);
+    tnr_ready
 }
 
 fn is_image_file(p: &Path) -> bool {
@@ -891,6 +1091,265 @@ fn is_image_file(p: &Path) -> bool {
                 "jpg" | "jpeg" | "png" | "bmp" | "webp" | "gif"
             )
         })
+}
+
+fn is_video_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            matches!(
+                e.to_lowercase().as_str(),
+                "mp4" | "avi" | "mov" | "mkv" | "webm" | "wmv" | "m4v" | "mpeg" | "mpg"
+            )
+        })
+}
+
+/// 单条视频可展开的最大帧数（避免内存中存百万级路径）。
+const MAX_VIDEO_FRAMES: u32 = 200_000;
+
+#[derive(Clone)]
+struct VideoSession {
+    /// 与 `stem_######.jpg` 同前缀的已净化主名，用于同目录多视频时区分 `class_log_{stem}.txt`。
+    stem: String,
+    frames: Vec<RgbaImage>,
+}
+
+#[derive(Clone, Copy)]
+struct VideoProbe {
+    frame_count: u32,
+    fps: f32,
+    width: u32,
+    height: u32,
+}
+
+struct VideoLoadResult {
+    video_path: PathBuf,
+    out_dir: PathBuf,
+    stem: String,
+    fps: f32,
+    frames: Vec<RgbaImage>,
+}
+
+enum VideoLoadMsg {
+    Status { text: String, progress: f32 },
+    Done(Result<VideoLoadResult, String>),
+}
+
+fn ffmpeg_binary_path() -> PathBuf {
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn ffprobe_binary_path() -> PathBuf {
+    let name = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn sanitize_file_stem(stem: &str) -> String {
+    let mut s = String::new();
+    for ch in stem.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ' ');
+        s.push(if ok { ch } else { '_' });
+    }
+    let t = s.trim();
+    if t.is_empty() {
+        "video_frames".to_string()
+    } else {
+        t.chars().take(120).collect()
+    }
+}
+
+fn parse_r_frame_rate(s: &str) -> Option<f32> {
+    let t = s.trim();
+    if let Some((a, b)) = t.split_once('/') {
+        let n: f32 = a.trim().parse().ok()?;
+        let d: f32 = b.trim().parse().ok()?;
+        if d.abs() > 1e-6 {
+            return Some(n / d);
+        }
+    }
+    t.parse::<f32>().ok()
+}
+
+/// 用 ffprobe 取宽高、时长、帧率与帧数；没有可靠帧数时按时长 * 帧率估算。
+fn probe_video_stream(path: &Path) -> Result<VideoProbe, String> {
+    let ffprobe = ffprobe_binary_path();
+    let mut cmd = Command::new(&ffprobe);
+    command_hide_console(&mut cmd);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,duration,r_frame_rate,nb_frames",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1",
+    ])
+    .arg(path);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("无法运行 ffprobe（{ffprobe:?}）：{e}。请安装 FFmpeg 或将 ffprobe 放在 exe 同目录。"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ffprobe 失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut dur_sec: Option<f32> = None;
+    let mut fps: Option<f32> = None;
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    let mut nb_frames: Option<u32> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "width" => width = value.parse::<u32>().ok().filter(|v| *v > 0),
+            "height" => height = value.parse::<u32>().ok().filter(|v| *v > 0),
+            "r_frame_rate" => {
+                if let Some(f) = parse_r_frame_rate(value) {
+                    if f.is_finite() && f > 0.01 {
+                        fps = Some(f);
+                    }
+                }
+            }
+            "duration" => {
+                if let Ok(d) = value.parse::<f32>() {
+                    if d.is_finite() && d > 0.0 {
+                        dur_sec = Some(dur_sec.map_or(d, |a| a.max(d)));
+                    }
+                }
+            }
+            "nb_frames" => nb_frames = value.parse::<u32>().ok().filter(|v| *v > 0),
+            _ => {}
+        }
+    }
+    let fps = fps.unwrap_or(25.0).max(0.01);
+    let width = width.ok_or_else(|| "ffprobe 未返回视频宽度".to_string())?;
+    let height = height.ok_or_else(|| "ffprobe 未返回视频高度".to_string())?;
+    let mut n = nb_frames.unwrap_or_else(|| {
+        let dur = dur_sec.unwrap_or(0.0).max(0.0);
+        ((dur * fps).ceil() as u32).max(1)
+    });
+    if n > MAX_VIDEO_FRAMES {
+        n = MAX_VIDEO_FRAMES;
+    }
+    Ok(VideoProbe {
+        frame_count: n,
+        fps,
+        width,
+        height,
+    })
+}
+
+fn decode_video_frames_rgba(
+    src: &Path,
+    probe: VideoProbe,
+    progress_tx: Option<&mpsc::Sender<VideoLoadMsg>>,
+) -> Result<Vec<RgbaImage>, String> {
+    let frame_bytes = (probe.width as usize)
+        .checked_mul(probe.height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "视频帧尺寸过大，无法分配内存".to_string())?;
+    let ffmpeg = ffmpeg_binary_path();
+    let mut cmd = Command::new(&ffmpeg);
+    command_hide_console(&mut cmd);
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+    ])
+    .arg(src)
+    .args([
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-frames:v",
+        &probe.frame_count.to_string(),
+        "-",
+    ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("无法运行 ffmpeg（{ffmpeg:?}）：{e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 ffmpeg 输出".to_string())?;
+    let mut frames = Vec::with_capacity(probe.frame_count as usize);
+    let progress_step = (probe.frame_count / 100).max(1);
+    for frame_idx in 0..probe.frame_count {
+        let mut buf = vec![0_u8; frame_bytes];
+        match stdout.read_exact(&mut buf) {
+            Ok(()) => {
+                let img = RgbaImage::from_raw(probe.width, probe.height, buf)
+                    .ok_or_else(|| "解析 raw RGBA 帧失败".to_string())?;
+                frames.push(img);
+                let frame_no = frame_idx + 1;
+                if frame_no == probe.frame_count || frame_no % progress_step == 0 {
+                    if let Some(tx) = progress_tx {
+                        let progress = 0.08 + 0.88 * (frame_no as f32 / probe.frame_count as f32);
+                        let _ = tx.send(VideoLoadMsg::Status {
+                            text: format!("正在读取完整帧：{frame_no}/{}", probe.frame_count),
+                            progress: progress.clamp(0.0, 0.98),
+                        });
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("读取视频帧失败：{e}")),
+        }
+    }
+    drop(stdout);
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 ffmpeg 结束失败：{e}"))?;
+    if !out.status.success() && frames.is_empty() {
+        return Err(format!(
+            "ffmpeg 解码失败：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if frames.is_empty() {
+        return Err("视频没有解码出任何帧".to_string());
+    }
+    Ok(frames)
 }
 
 /// YOLO 数据集常见布局：`.../images/.../a.jpg` 的标签在 `.../labels/.../a.txt`；否则与图片同目录的 `a.txt`。
@@ -929,7 +1388,12 @@ fn strip_first_dir_if(rel: &Path, dir_name: &str) -> PathBuf {
     rel.to_path_buf()
 }
 
-/// 同路径下存在非空标签行（YOLO .txt）则视为已标注。
+/// 同路径下 **存在** 与图对应的 `.txt` 文件（含空文件；用于与「无文件=未标」区分）。
+fn path_label_file_exists(image_path: &Path) -> bool {
+    label_txt_path_for_image(image_path).is_file()
+}
+
+/// 同路径下存在**至少一行**非注释、非空内容（不区分是否为有效 YOLO 框行，与旧版「有写东西」一致）。
 fn path_has_nonempty_label_file(image_path: &Path) -> bool {
     let lbl = label_txt_path_for_image(image_path);
     let Ok(text) = fs::read_to_string(&lbl) else {
@@ -941,7 +1405,16 @@ fn path_has_nonempty_label_file(image_path: &Path) -> bool {
     })
 }
 
-/// 仅所选目录当前层级内的图片文件（不进入子文件夹），与侧栏「选择图片目录」语义一致。
+/// 负样本：已有 `.txt` 且**无数值标签行**（全空或仅 # 备注），与「未创建 txt」相区别。
+fn path_is_negative_label_only(image_path: &Path) -> bool {
+    let lbl = label_txt_path_for_image(image_path);
+    if !lbl.is_file() {
+        return false;
+    }
+    !path_has_nonempty_label_file(image_path)
+}
+
+/// 仅所选目录当前层级内的图片文件（不进入子文件夹），与顶栏「选择图片目录」语义一致。
 fn gather_images_in_dir_flat(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else {
@@ -1303,6 +1776,354 @@ fn class_color_pick_button(
     }
 }
 
+const SHORTCUTS_HINT_BLUE: Color32 = Color32::from_rgb(110, 185, 255);
+const SHORTCUTS_SECTION_MAGENTA: Color32 = Color32::from_rgb(200, 150, 255);
+const SHORTCUTS_SECTION_ORANGE: Color32 = Color32::from_rgb(255, 165, 100);
+
+/// 快捷键面板内：等宽键名色块
+fn shortcut_kbd_chip(ui: &mut Ui, key_text: &str, key_tint: Color32) {
+    Frame::default()
+        .fill(color_alpha(key_tint, 32))
+        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+        .rounding(5.0)
+        .stroke(Stroke::new(1.0, color_alpha(key_tint, 170)))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(key_text)
+                    .monospace()
+                    .strong()
+                    .size(12.0)
+                    .color(key_tint),
+            );
+        });
+}
+
+/// 分节小标题 + 色条
+fn shortcut_section_header(ui: &mut Ui, title: &str, line: Color32) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
+        let (r, _gal) = ui.allocate_exact_size(Vec2::new(3.0, 18.0), Sense::hover());
+        ui.painter().rect_filled(r, 2.0, line);
+        ui.label(
+            RichText::new(title)
+                .strong()
+                .size(14.5)
+                .color(theme::TEXT),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// 多枚键帽 + 正文（`desc` 支持换行）
+fn shortcut_explain_line(ui: &mut Ui, keys: &[(&str, Color32)], desc: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 5.0);
+        for (k, tint) in keys {
+            shortcut_kbd_chip(ui, k, *tint);
+        }
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(desc)
+                .size(12.5)
+                .line_height(Some(18.5))
+                .color(color_alpha(theme::TEXT, 250)),
+        );
+    });
+    ui.add_space(3.0);
+}
+
+/// 画布与工具条：完整快捷键下拉说明（深色底、分色分节）
+fn canvas_shortcuts_help_popup(ui: &mut Ui) {
+    let a = theme::ACCENT;
+    let ok = theme::OK;
+    let warn = theme::WARN;
+    let danger = theme::DANGER;
+    let muted = theme::TEXT_MUTED;
+    let popup_id = ui.id().with("canvas_shortcuts_help");
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let chevron = if open { "  ▲" } else { "  ▼" };
+    let btn_fill = color_alpha(SHORTCUTS_HINT_BLUE, 20);
+    let btn_st = color_alpha(SHORTCUTS_HINT_BLUE, 190);
+    let btn_resp = ui
+        .add_sized(
+            [228.0, 31.0],
+            egui::Button::new(
+                RichText::new(format!("查看完整快捷键{chevron}"))
+                    .size(15.0)
+                    .strong()
+                    .color(SHORTCUTS_HINT_BLUE),
+            )
+            .frame(true)
+            .fill(btn_fill)
+            .stroke(Stroke::new(1.2, btn_st)),
+        );
+    if btn_resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    if !ui.memory(|m| m.is_popup_open(popup_id)) {
+        return;
+    }
+
+    let area_response = Area::new(popup_id)
+        .kind(UiKind::Picker)
+        .order(Order::Foreground)
+        .fixed_pos(btn_resp.rect.left_bottom() + Vec2::new(0.0, 6.0))
+        .show(ui.ctx(), |ui| {
+            Frame::default()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.5, color_alpha(a, 180)))
+                .inner_margin(egui::Margin::same(14.0))
+                .rounding(14.0)
+                .show(ui, |ui| {
+                    // 顶部标题带渐变感：深色条 + 彩色字
+                    let header_bar = color_alpha(SHORTCUTS_SECTION_MAGENTA, 16);
+                    Frame::default()
+                        .fill(header_bar)
+                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .rounding(8.0)
+                        .stroke(Stroke::new(1.0, color_alpha(SHORTCUTS_SECTION_MAGENTA, 90)))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("全局快捷键总览")
+                                    .strong()
+                                    .size(17.0)
+                                    .color(SHORTCUTS_SECTION_MAGENTA),
+                            );
+                            ui.label(
+                                RichText::new("与深色界面配色区分：蓝=导航/视口 · 绿=平移/确认 · 黄/橙=模式 · 红/粉=危险/命名 · 下表与当前代码一致")
+                                    .size(11.0)
+                                    .line_height(Some(16.0))
+                                    .color(muted),
+                            );
+                        });
+                    ui.add_space(6.0);
+
+                    egui::ScrollArea::vertical()
+                        .max_height(500.0)
+                        .auto_shrink([false, true])
+                        .id_salt("canvas_shortcuts_help_scroll")
+                        .show(ui, |ui| {
+                            ui.set_max_width(560.0);
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+
+                            shortcut_section_header(
+                                ui,
+                                "顶栏与切图（A / D）",
+                                SHORTCUTS_HINT_BLUE,
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[("A", a), ("D", a)],
+                                "上一张 / 下一张图片或视频帧。在「标签窗未打开且其它控件未抢夺键盘」时生效；将鼠标悬停在大图画布上时，即其它处正在输入，也可 A/D 切图。与顶栏「上一张A」「下一张D」等效。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[],
+                                "图集模式：底栏/顶栏的帧进度条可点击或拖动跳帧，白条=当前、红点区段=已存标注的帧。",
+                            );
+
+                            shortcut_section_header(
+                                ui,
+                                "视口与缩放",
+                                a,
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Ctrl", a),
+                                    ("＋ 滚轮", a),
+                                ],
+                                "在画布上「按住 Control（或 macOS 上的 Cmd）再滚动」：缩放；光标附近保持位置感。无修饰键的滚轮用于下方「有选中框时切类别」。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Space", ok),
+                                ],
+                                "按住空格 且 鼠标在画布上：平移主图（抓手光标）。若正在输入、标签弹窗、或 E/F 涂鸦，空格可能被占用。",
+                            );
+
+                            shortcut_section_header(ui, "模式开关（R / E / F，全局无文本焦点时）", warn);
+                            shortcut_explain_line(
+                                ui,
+                                &[("R", a)],
+                                "「矩形两点框」模式启停。开启时左键在图上点第一点、再点第二点完成一框，随后弹出标签命名。再按 R 为关闭。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[("E", warn)],
+                                "「柔性外接」：单笔画一笔成一个框。再按 E 关闭。若曾打开 R 会先协调退出矩形二点、清空选中。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[("F", warn)],
+                                "「连续柔性外接」（F 套圈可保留外周等；具体合并规则以画布逻辑为准。）再按 F 关。E/F 与 R 互斥。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[("Esc", muted)],
+                                "在多种状态下取消：如标签名输入窗可关闭、退出 E/F 的笔画准备、正在等矩形第二点时清空等（未打开标签窗时，Esc 不关闭训练日志等其它面板）。",
+                            );
+
+                            shortcut_section_header(
+                                ui,
+                                "有选中框时 · 视口内",
+                                ok,
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("滚轮", ok),
+                                ],
+                                "未按 Ctrl、未按空格 且 已选中有框 且 侧栏有类别时：滚轮循环切换该框的类别（有撤销入栈）。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("W", a),
+                                    ("S", a),
+                                ],
+                                "在图上某像素有多框重叠、且未在拖拽时，以当前鼠标位置在重叠栈中 W 向上 / S 向下 切换选中的那一框；之後若指针在屏幕上未明显移动，则 双击 会改 W/S 选到的那一框，若已明显移动或仅缩放则双击仍从叠层最上格命中。",
+                            );
+
+                            shortcut_section_header(
+                                ui,
+                                "删除与撤销",
+                                danger,
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Delete", danger),
+                                ],
+                                "删除当前选中的框（若可删）并保存标签。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Q", danger),
+                                ],
+                                "在未打开标签命名窗 且 其它处未吃键盘 时，删除当前选中框。若打开的是标签窗，见下方「Q = 仅取消本次命名」。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Ctrl+Z", ok),
+                                ],
+                                "或 macOS：Cmd+Z，按撤销栈回退一步（有焦点限制：标签窗开时 R/E/F/Ctrl+Z 由全局与输入争用，请优先在画布操作）。",
+                            );
+
+                            shortcut_section_header(
+                                ui,
+                                "标签命名小窗",
+                                SHORTCUTS_SECTION_ORANGE,
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Enter", ok),
+                                ],
+                                "在「输入或重命名」文本框有焦点 时 确认；无焦点 时 空格/回车 均可作「确定」等效。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Space", ok),
+                                ],
+                                "文本框未聚焦时，可与 Enter 同作「确定」。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[
+                                    ("Q", danger),
+                                    ("Esc", muted),
+                                ],
+                                "取消此次命名/改名（新框不落地；已有框的修改可取消）。Q 在输入框内会当普通字符，请先失焦。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[],
+                                "在图上 双击 某已有框的填充区域：直接打开本窗编辑该类别的文字标签。",
+                            );
+
+                            shortcut_section_header(ui, "鼠标 · 与右键", SHORTCUTS_SECTION_ORANGE);
+                            shortcut_explain_line(
+                                ui,
+                                &[],
+                                "右键 在空白处 或 部分状态：可退出 E/F/涂鸦/矩形等中间状态、关闭 R 的第一笔、在空白 取消全选 等（不点到框/柄上时）。与 `secondary_click` 分支一致。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[],
+                                "左键拖拽：移动框、拉角/边缩放。环轨/视频等界面另有「单击缩略图」「条上拖动」等提示，见主界面。",
+                            );
+
+                            shortcut_section_header(
+                                ui,
+                                "环轨相册（主图缩很多时）",
+                                a,
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[],
+                                "在环形缩略外区域 拖动 旋转；点某张 与 A/D 一样切换当前图。主图内仍遵守框编辑逻辑。",
+                            );
+
+                            ui.add_space(8.0);
+                            Frame::default()
+                                .fill(color_alpha(danger, 18))
+                                .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                                .rounding(6.0)
+                                .stroke(Stroke::new(1.0, color_alpha(danger, 100)))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("关闭本表")
+                                            .size(12.0)
+                                            .color(color_alpha(theme::TEXT, 220)),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        shortcut_kbd_chip(ui, "Esc", a);
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("或 点击 空白/其它处")
+                                                .size(12.0)
+                                                .color(muted),
+                                        );
+                                    });
+                                });
+                        });
+                });
+        })
+        .response;
+
+    if !btn_resp.clicked()
+        && (ui.input(|i| i.key_pressed(Key::Escape)) || area_response.clicked_elsewhere())
+    {
+        ui.memory_mut(|m| m.close_popup());
+    }
+}
+
+/// 从 YOLO 标签文件统计「不同 class 列数」与「有效框行数」（不读图像尺寸）。
+fn label_txt_class_box_counts(path: &Path) -> Option<(usize, usize)> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return None;
+    };
+    let mut seen = HashSet::new();
+    let mut n = 0usize;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let cid: usize = t.split_whitespace().next()?.parse().ok()?;
+        seen.insert(cid);
+        n += 1;
+    }
+    Some((seen.len(), n))
+}
+
 fn load_annotations(path: &Path, w: u32, h: u32) -> Vec<Bbox> {
     let Ok(file) = fs::File::open(path) else {
         return Vec::new();
@@ -1542,8 +2363,20 @@ fn prepare_training_bundle_in_dir(
     let img_out = bundle.join("images");
     let lbl_out = bundle.join("labels");
     let mut labels_copied = 0usize;
+    let mut skipped_no_training_labels = 0usize;
 
     for src_img in image_paths {
+        let Ok(img) = image::open(src_img) else {
+            skipped_no_training_labels += 1;
+            continue;
+        };
+        let (w, h) = img.dimensions();
+        let src_lbl = label_txt_path_for_image(src_img);
+        if load_annotations(&src_lbl, w, h).is_empty() {
+            skipped_no_training_labels += 1;
+            continue;
+        }
+
         let rel_raw = path_relative_to(src_img, image_root);
         let rel_img = strip_first_dir_if(&rel_raw, "images");
         let dst_img = img_out.join(&rel_img);
@@ -1551,16 +2384,19 @@ fn prepare_training_bundle_in_dir(
             format!("复制图片失败 {} -> {}: {e}", src_img.display(), dst_img.display())
         })?;
 
-        let src_lbl = label_txt_path_for_image(src_img);
-        if src_lbl.is_file() {
-            let rel_lbl_raw = path_relative_to(&src_lbl, image_root);
-            let rel_lbl = strip_first_dir_if(&rel_lbl_raw, "labels");
-            let dst_lbl = lbl_out.join(&rel_lbl);
-            copy_file_create_parent(&src_lbl, &dst_lbl).map_err(|e| {
-                format!("复制标签失败 {}: {e}", src_lbl.display())
-            })?;
-            labels_copied += 1;
-        }
+        let rel_lbl_raw = path_relative_to(&src_lbl, image_root);
+        let rel_lbl = strip_first_dir_if(&rel_lbl_raw, "labels");
+        let dst_lbl = lbl_out.join(&rel_lbl);
+        copy_file_create_parent(&src_lbl, &dst_lbl).map_err(|e| {
+            format!("复制标签失败 {}: {e}", src_lbl.display())
+        })?;
+        labels_copied += 1;
+    }
+
+    if skipped_no_training_labels > 0 {
+        let _ = tx.send(TrainMsg::Line(format!(
+            "[准备] 已跳过 {skipped_no_training_labels} 张未进入训练包的图片（无法打开或无有效标注行）。"
+        )));
     }
 
     if labels_copied == 0 {
@@ -1608,6 +2444,7 @@ struct YoloTrainerApp {
     /// `conda env list` 解析得到的环境根目录（含 python.exe）。
     conda_env_paths: Vec<String>,
     conda_env_idx: usize,
+    conda_env_custom_root: String,
     conda_env_list_bootstrapped: bool,
     use_builtin_cpu_train: bool,
     sidebar_open_section: Option<u8>,
@@ -1621,8 +2458,12 @@ struct YoloTrainerApp {
     pending_box: Option<PendingBox>,
     /// 双击已有框时，待确认修改的框索引（与 `pending_box` 互斥）。
     label_edit_idx: Option<usize>,
+    /// 标签窗内按 Q 取消后，本帧跳过画布上 Q 删除选中框（避免与「取消改名」同键冲突）。
+    suppress_bbox_q_delete_once: bool,
 
     image_paths: Vec<PathBuf>,
+    /// 视频逐帧模式：源视频与帧率；仅当用户保存过带框标注时，对应帧才写入与视频同目录的 jpg + txt。
+    video_session: Option<VideoSession>,
     current_index: usize,
     rgba: Option<RgbaImage>,
     image_texture: Option<egui::TextureHandle>,
@@ -1631,6 +2472,8 @@ struct YoloTrainerApp {
     draw_phase: DrawPhase,
     selected: Option<usize>,
     drag: Option<(DragKind, usize)>, // kind, bbox index
+    /// W/S 在重叠栈中切框后、若指针在屏幕上几乎未动则双击改该 `target`；元组存当时指针的屏幕 `Pos2`，避免仅缩放时误清。
+    stack_nav_dblclk_lock: Option<(Pos2, usize, usize)>,
 
     /// 与 `selected` 同步；换选中框时清零下列动画状态。
     handles_anim_sel: Option<usize>,
@@ -1647,6 +2490,10 @@ struct YoloTrainerApp {
     training_pid: Option<u32>,
     /// 用户在子进程启动前点了「停止」：收到 PID 后立即结束进程。
     training_stop_pending: bool,
+    video_load_rx: Option<Receiver<VideoLoadMsg>>,
+    video_load_busy: bool,
+    video_load_status: String,
+    video_load_progress: f32,
 
     /// 辅助标注：ONNX 模型路径与 ort 会话（纯 Rust 推理，不依赖 Conda）。
     assist_onnx_path: Option<PathBuf>,
@@ -1665,6 +2512,8 @@ struct YoloTrainerApp {
     assist_overlay_visible: bool,
     /// ONNX 辅助检测：后处理置信度下限（与导出模型内置阈值无关）。
     assist_onnx_conf: f32,
+    /// ONNX 辅助检测：`nms=False` 时在 Rust 内做 NMS 的 IoU 阈值（`nms=True` 的模型不经过此路径）。
+    assist_onnx_iou: f32,
 
     /// 画布缩放（相对适应窗口的矩形）。
     view_zoom: f32,
@@ -1690,7 +2539,7 @@ struct YoloTrainerApp {
     /// 标签窗：一次确认的多个新框（连续柔性外接结束一笔时）。
     pending_boxes_batch: Vec<PendingBox>,
 
-    /// 训练 epoch 数（在「开始训练」按钮上滚轮调整；普通每次 ±10，Shift 每次 ±50）。
+    /// 训练 epoch 数。
     train_epochs: u32,
     train_epoch_scroll_accum: f32,
 
@@ -1702,16 +2551,47 @@ struct YoloTrainerApp {
     annotated_strip_dirty: bool,
     /// `image_paths` 下标，对应磁盘上已有非空 .txt 的图。
     annotated_strip_indices: Vec<usize>,
+    /// `image_paths` 下标：无有效标签行（无文件或空/仅注释）的图。
+    unannotated_strip_indices: Vec<usize>,
+    /// 与 `annotated_strip_indices` 对齐：每条 `(不同类别数, 框数)`，用于已标注列表备注。
+    annotated_strip_summaries: Vec<(usize, usize)>,
+    /// 与 `annotated_strip_indices` 等长：该条为「仅空 txt 负样本」时为 `true`。
+    annotated_strip_is_neg: Vec<bool>,
+    /// 全库统计：有框的图数、仅负样本的图数（顶栏/进度条说明用）。
+    dataset_n_with_boxes: usize,
+    dataset_n_neg_only: usize,
+    /// 顶栏「上一张A」「下一张D」点击后触发描边/光晕强度 0~1，逐帧衰减。
+    image_nav_btn_fx: [f32; 2],
+    /// 仅上/下一张步进为 true 时，下一帧在顶栏已标注列表中把当前行 `scroll_to_me` 一次；点列表/其它跳转不设，避免手滚时回弹。
+    annotated_strip_step_scroll_pending: bool,
+    /// 顶栏帧进度条：桶数（≤ 图数），与 `image_paths` 等长映射；红=有框，蓝=仅负样本。
+    image_nav_progress_bucket_n: usize,
+    image_nav_progress_bucket_has_box: Vec<bool>,
+    image_nav_progress_bucket_has_neg: Vec<bool>,
 
     /// `class_log.txt` 需在下一帧写回磁盘。
     class_log_dirty: bool,
     /// 已做过首次从当前 `image_root` 读取 class_log（避免重复覆盖）。
     class_log_bootstrapped: bool,
+
+    /// 环轨相册（缩放较小时）：环方位角（rad）。
+    carousel_ring_angle: f32,
+    /// 角速度（rad/s），松手后指数衰减。
+    carousel_ring_vel: f32,
+    /// 本次拖动是否从主图矩形外按下（避免与框拖拽冲突）。
+    carousel_ring_drag_from_outer: bool,
+    carousel_ring_tex: HashMap<usize, egui::TextureHandle>,
+    /// 环轨相册当前查看：已标注集 / 未标注集。
+    carousel_ring_pool: CarouselRingPool,
+    /// 顶栏品牌 logo（启动时从固定路径尝试加载，失败时仅无图组合）。
+    top_bar_logo: Option<egui::TextureHandle>,
+    /// 已注册 Windows `times.ttf` 为 `TNR_Brand`（供品牌名用）。
+    brand_tnr: bool,
 }
 
 impl YoloTrainerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        try_load_chinese_font(&cc.egui_ctx);
+        let brand_tnr = setup_app_fonts(&cc.egui_ctx);
         let mut visuals = egui::Visuals::dark();
         visuals.window_fill = theme::SURFACE;
         visuals.panel_fill = theme::SURFACE;
@@ -1742,12 +2622,33 @@ impl YoloTrainerApp {
         style.visuals.widgets.active.rounding = egui::Rounding::same(10.0);
         cc.egui_ctx.set_style(style);
 
+        let top_bar_logo = (|| {
+            let p = std::path::Path::new(r"C:\Users\78672\Pictures\lll.png");
+            let img = image::open(p).ok()?;
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                rgba.as_raw(),
+            );
+            Some(cc.egui_ctx.load_texture(
+                "top_bar_logo",
+                color_image,
+                egui::TextureOptions::LINEAR,
+            ))
+        })();
+
         Self {
             image_root: PathBuf::from("."),
             conda_env_paths: Vec::new(),
             conda_env_idx: 0,
+            conda_env_custom_root: default_conda_env_path(),
             conda_env_list_bootstrapped: false,
             use_builtin_cpu_train: false,
+            // 1 = 类别管理，2 = 训练配置（原「数据集」折叠栏已移除）
             sidebar_open_section: Some(1),
             sidebar_width: 344.0,
             model_preset: ModelPreset::Yolo11n,
@@ -1757,7 +2658,9 @@ impl YoloTrainerApp {
             show_label_window: false,
             pending_box: None,
             label_edit_idx: None,
+            suppress_bbox_q_delete_once: false,
             image_paths: Vec::new(),
+            video_session: None,
             current_index: 0,
             rgba: None,
             image_texture: None,
@@ -1766,6 +2669,7 @@ impl YoloTrainerApp {
             draw_phase: DrawPhase::Idle,
             selected: None,
             drag: None,
+            stack_nav_dblclk_lock: None,
             handles_anim_sel: None,
             corner_hover_radius_anim: [0.0; 4],
             edge_hover_anim: [0.0; 4],
@@ -1775,6 +2679,10 @@ impl YoloTrainerApp {
             train_rx: None,
             training_pid: None,
             training_stop_pending: false,
+            video_load_rx: None,
+            video_load_busy: false,
+            video_load_status: String::new(),
+            video_load_progress: 0.0,
             assist_onnx_path: None,
             assist_ort: None,
             assist_class_names: Vec::new(),
@@ -1786,6 +2694,7 @@ impl YoloTrainerApp {
             assist_batch_busy: false,
             assist_overlay_visible: true,
             assist_onnx_conf: onnx_assist::ASSIST_ONNX_CONF,
+            assist_onnx_iou: onnx_assist::ASSIST_ONNX_IOU,
             view_zoom: 1.0,
             view_pan: Vec2::ZERO,
             last_canvas_inner: None,
@@ -1805,13 +2714,45 @@ impl YoloTrainerApp {
             undo_suspend: false,
             annotated_strip_dirty: true,
             annotated_strip_indices: Vec::new(),
+            unannotated_strip_indices: Vec::new(),
+            annotated_strip_summaries: Vec::new(),
+            annotated_strip_is_neg: Vec::new(),
+            dataset_n_with_boxes: 0,
+            dataset_n_neg_only: 0,
+            image_nav_btn_fx: [0.0; 2],
+            annotated_strip_step_scroll_pending: false,
+            image_nav_progress_bucket_n: 0,
+            image_nav_progress_bucket_has_box: Vec::new(),
+            image_nav_progress_bucket_has_neg: Vec::new(),
             class_log_dirty: false,
             class_log_bootstrapped: false,
+            carousel_ring_angle: 0.0,
+            carousel_ring_vel: 0.0,
+            carousel_ring_drag_from_outer: false,
+            carousel_ring_tex: HashMap::new(),
+            carousel_ring_pool: CarouselRingPool::Annotated,
+            top_bar_logo,
+            brand_tnr,
         }
     }
 
+    /// 品牌名 YoloVet 使用的字体（Times New Roman 或回退为 UI 无衬线）。
+    fn brand_name_font(&self, size: f32) -> FontId {
+        if self.brand_tnr {
+            FontId::new(size, FontFamily::Name("TNR_Brand".into()))
+        } else {
+            FontId::proportional(size)
+        }
+    }
+
+    /// 写入/撤销等使用的类别表路径。图片集：`class_log.txt`；视频集：`class_log_{stem}.txt`（同目录多视频不共用一名）。
     fn class_log_path(&self) -> PathBuf {
-        self.image_root.join(CLASS_LOG_FILENAME)
+        if let Some(vs) = &self.video_session {
+            self.image_root
+                .join(format!("class_log_{}.txt", &vs.stem))
+        } else {
+            self.image_root.join(CLASS_LOG_FILENAME)
+        }
     }
 
     fn ensure_assist_pred_class_mask(&mut self) {
@@ -1852,17 +2793,33 @@ impl YoloTrainerApp {
         assist_class_mask_allows(&self.assist_pred_class_on, model_class_id)
     }
 
-    /// 若存在 `class_log.txt` 则读入并覆盖当前 `classes`（调用前通常已清空列表）。
+    /// 从磁盘重载 `classes`：切换数据根或视频后应调用；无文件时清空（与选图片目录时一致，不会残留上一次的类别）。
     fn load_class_log_from_disk(&mut self) {
-        let path = self.class_log_path();
-        if !path.is_file() {
-            return;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            return;
-        };
         self.classes.clear();
         self.class_colors.clear();
+        // 读路径：图片模式仅 `class_log.txt`；视频模式先 `class_log_{stem}.txt`，若无则回退到同目录 `class_log.txt`（旧版习惯）
+        let path = if let Some(vs) = &self.video_session {
+            let a = self
+                .image_root
+                .join(format!("class_log_{}.txt", &vs.stem));
+            if a.is_file() {
+                a
+            } else {
+                let b = self.image_root.join(CLASS_LOG_FILENAME);
+                if b.is_file() { b } else { self.active_class_idx = 0; return; }
+            }
+        } else {
+            let p = self.image_root.join(CLASS_LOG_FILENAME);
+            if !p.is_file() {
+                self.active_class_idx = 0;
+                return;
+            }
+            p
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            self.active_class_idx = 0;
+            return;
+        };
         for line in text.lines() {
             let t = line.trim_end_matches('\r').trim();
             if !t.is_empty() && !t.starts_with('#') {
@@ -1943,11 +2900,15 @@ impl YoloTrainerApp {
             .min(self.conda_env_paths.len().saturating_sub(1));
     }
 
-    fn selected_conda_root(&self) -> &str {
+    fn resolved_conda_root(&self) -> String {
+        let custom = self.conda_env_custom_root.trim();
+        if !custom.is_empty() {
+            return custom.to_string();
+        }
         self.conda_env_paths
             .get(self.conda_env_idx)
-            .map(|s| s.as_str())
-            .unwrap_or("")
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn display_color_for_class(&self, class_id: usize) -> Color32 {
@@ -1973,7 +2934,17 @@ impl YoloTrainerApp {
     }
 
     fn switch_image_root(&mut self, new_root: PathBuf) {
+        let was_video_mode = self.video_session.is_some();
         if self.image_root == new_root {
+            if was_video_mode {
+                let _ = self.save_current_labels();
+                self.cancel_assist_tasks();
+                self.reset_canvas_runtime_cache();
+                self.annotated_strip_indices.clear();
+                self.unannotated_strip_indices.clear();
+                self.video_session = None;
+                self.current_index = 0;
+            }
             self.refresh_image_list();
             return;
         }
@@ -1981,9 +2952,72 @@ impl YoloTrainerApp {
         self.cancel_assist_tasks();
         self.reset_canvas_runtime_cache();
         self.annotated_strip_indices.clear();
+        self.unannotated_strip_indices.clear();
+        self.video_session = None;
         self.current_index = 0;
         self.image_root = new_root;
         self.refresh_image_list();
+    }
+
+    /// 载入视频：从第 0 帧起可浏览；仅当保存带框标注时写入与视频同目录的 jpg + txt。
+    fn load_video_session(&mut self, video_path: PathBuf) {
+        self.cancel_assist_tasks();
+        if !video_path.is_file() || !is_video_file(&video_path) {
+            self.train_log
+                .push("[视频] 请选择一个视频文件（如 mp4、mov、mkv、webm）。".to_string());
+            return;
+        }
+        if self.video_load_busy {
+            self.train_log
+                .push("[视频] 当前已有视频正在载入，请等待完成。".to_string());
+            return;
+        }
+        let _ = self.save_current_labels();
+        let (tx, rx) = mpsc::channel();
+        self.video_load_rx = Some(rx);
+        self.video_load_busy = true;
+        self.video_load_progress = 0.01;
+        self.video_load_status = "正在读取视频信息...".to_string();
+        self.train_log
+            .push(format!("[视频] 开始载入 {}", video_path.display()));
+
+        thread::spawn(move || {
+            let result = (|| -> Result<VideoLoadResult, String> {
+                let _ = tx.send(VideoLoadMsg::Status {
+                    text: "正在读取视频信息...".to_string(),
+                    progress: 0.02,
+                });
+                let probe = probe_video_stream(&video_path)?;
+                let _ = tx.send(VideoLoadMsg::Status {
+                    text: format!(
+                        "准备读取完整帧：{} 帧，{}x{} @ {:.2} fps",
+                        probe.frame_count, probe.width, probe.height, probe.fps
+                    ),
+                    progress: 0.06,
+                });
+                let frames = decode_video_frames_rgba(&video_path, probe, Some(&tx))?;
+                if frames.is_empty() {
+                    return Err("视频没有解码出任何帧".to_string());
+                }
+                let out_dir = video_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let stem = video_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(sanitize_file_stem)
+                    .unwrap_or_else(|| "video_frames".to_string());
+                Ok(VideoLoadResult {
+                    video_path,
+                    out_dir,
+                    stem,
+                    fps: probe.fps,
+                    frames,
+                })
+            })();
+            let _ = tx.send(VideoLoadMsg::Done(result));
+        });
     }
 
     fn refresh_image_list(&mut self) {
@@ -1991,15 +3025,16 @@ impl YoloTrainerApp {
         self.reset_canvas_runtime_cache();
         self.mark_annotated_strip_dirty();
         self.annotated_strip_indices.clear();
-        self.classes.clear();
-        self.class_colors.clear();
-        self.active_class_idx = 0;
-        self.load_class_log_from_disk();
-        self.image_paths = if self.image_root.is_dir() {
-            gather_images_for_dataset_root(&self.image_root)
-        } else {
-            Vec::new()
-        };
+        self.unannotated_strip_indices.clear();
+        if self.video_session.is_none() {
+            // `load_class_log_from_disk` 会先清空再读盘（与换目录/无文件时一致）
+            self.load_class_log_from_disk();
+            self.image_paths = if self.image_root.is_dir() {
+                gather_images_for_dataset_root(&self.image_root)
+            } else {
+                Vec::new()
+            };
+        }
         if self.current_index >= self.image_paths.len() {
             self.current_index = self.image_paths.len().saturating_sub(1);
         }
@@ -2019,13 +3054,388 @@ impl YoloTrainerApp {
             return;
         }
         self.annotated_strip_dirty = false;
+        // 已标栏：有 `.txt` 即视为已处理（含空 txt 的负样本）；无 txt 为未标
         self.annotated_strip_indices = self
             .image_paths
             .iter()
             .enumerate()
-            .filter(|(_, p)| path_has_nonempty_label_file(p))
+            .filter(|(_, p)| path_label_file_exists(p))
             .map(|(i, _)| i)
             .collect();
+        self.unannotated_strip_indices = self
+            .image_paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !path_label_file_exists(p))
+            .map(|(i, _)| i)
+            .collect();
+        self.annotated_strip_summaries = self
+            .annotated_strip_indices
+            .iter()
+            .map(|&idx| {
+                self.image_paths
+                    .get(idx)
+                    .and_then(|p| label_txt_class_box_counts(&label_txt_path_for_image(p)))
+                    .unwrap_or((0, 0))
+            })
+            .collect();
+        self.annotated_strip_is_neg = self
+            .annotated_strip_indices
+            .iter()
+            .filter_map(|&idx| self.image_paths.get(idx))
+            .map(|p| path_is_negative_label_only(p))
+            .collect();
+        self.dataset_n_with_boxes = self
+            .image_paths
+            .iter()
+            .filter(|p| path_has_nonempty_label_file(p))
+            .count();
+        self.dataset_n_neg_only = self
+            .image_paths
+            .iter()
+            .filter(|p| path_is_negative_label_only(p))
+            .count();
+        self.carousel_ring_tex.clear();
+
+        let n = self.image_paths.len();
+        const MAX_BUCKETS: usize = 1200;
+        if n == 0 {
+            self.image_nav_progress_bucket_n = 0;
+            self.image_nav_progress_bucket_has_box.clear();
+            self.image_nav_progress_bucket_has_neg.clear();
+        } else {
+            let bucket_n = n.min(MAX_BUCKETS);
+            let mut has_box = vec![false; bucket_n];
+            let mut has_neg = vec![false; bucket_n];
+            for (idx, p) in self.image_paths.iter().enumerate() {
+                let bi = (idx * bucket_n / n).min(bucket_n.saturating_sub(1));
+                if path_has_nonempty_label_file(p) {
+                    has_box[bi] = true;
+                } else if path_is_negative_label_only(p) {
+                    has_neg[bi] = true;
+                }
+            }
+            self.image_nav_progress_bucket_n = bucket_n;
+            self.image_nav_progress_bucket_has_box = has_box;
+            self.image_nav_progress_bucket_has_neg = has_neg;
+        }
+    }
+
+    #[inline]
+    fn carousel_ring_indices(&self) -> &[usize] {
+        match self.carousel_ring_pool {
+            CarouselRingPool::Annotated => &self.annotated_strip_indices,
+            CarouselRingPool::Unannotated => &self.unannotated_strip_indices,
+        }
+    }
+
+    fn set_carousel_ring_pool(&mut self, pool: CarouselRingPool) {
+        if self.carousel_ring_pool == pool {
+            return;
+        }
+        self.carousel_ring_pool = pool;
+        self.carousel_ring_angle = 0.0;
+        self.carousel_ring_vel = 0.0;
+        self.carousel_ring_drag_from_outer = false;
+        self.carousel_ring_tex.clear();
+    }
+
+    #[inline]
+    fn carousel_ring_active(&self) -> bool {
+        self.view_zoom <= CAROUSEL_RING_ZOOM_MAX
+            && !self.show_label_window
+            && !self.image_paths.is_empty()
+    }
+
+    fn carousel_ring_items(&self, inner: Rect) -> Vec<(f32, usize, Rect)> {
+        let indices = self.carousel_ring_indices();
+        let n = indices.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let cx = inner.center().x;
+        let cy = inner.center().y + inner.height() * 0.05;
+        let r_min = inner.width().min(inner.height());
+        let scale_ui = (r_min / 520.0).clamp(0.66, 1.48);
+        let n_f = n as f32;
+        let tau = std::f32::consts::TAU;
+        // 大图集：整库 n 张只在「角度」上滚动浏览，环上只放 vis 个槽位，半径按槽位数取疏密度，始终在视口附近可见。
+        // 转一整圈 (2π) 对应滚过 n 张图，避免 n=1000 时半径大到整环都在屏外。
+        let vis_cap = ((r_min / 24.0).round() as usize).clamp(16, 42);
+        let vis = n.min(vis_cap).max(1);
+        let vis_f = vis as f32;
+        let sin_v = (std::f32::consts::PI / vis_f).max(1e-4).sin().max(1e-3);
+        let want_gap = (92.0 + 0.05 * n_f.min(800.0)) * scale_ui;
+        let ring_r_base = r_min * 0.415;
+        let ring_r_layout = ring_r_base.max(want_gap / (2.0 * sin_v));
+        let max_side_est = (30.0 + 188.0) * scale_ui;
+        let spread_max = 0.84_f32 + 0.34_f32;
+        let pad = 12.0_f32;
+        let half_span = inner.width().min(inner.height()) * 0.5 - pad - max_side_est * 0.55;
+        let ring_cap = (half_span / spread_max).max(r_min * 0.38);
+        let ring_r = ring_r_layout.min(ring_cap);
+        let scroll = (-self.carousel_ring_angle / tau) * n_f;
+        let mut items: Vec<(f32, usize, Rect)> = Vec::with_capacity(vis);
+        for j in 0..vis {
+            let ang = self.carousel_ring_angle + tau * (j as f32) / vis_f;
+            let (s, c) = ang.sin_cos();
+            let depth = (1.0 + c) * 0.5;
+            let t = (depth.clamp(0.0, 1.0)).powf(1.2);
+            let smooth = t * t * (3.0 - 2.0 * t);
+            let spread = 0.84 + 0.34 * smooth;
+            let px = cx + ring_r * s * spread;
+            let py = cy - ring_r * (0.48 + 0.12 * smooth) * c - r_min * 0.028 * smooth;
+            let crowding = (n_f / 120.0).powf(0.12).max(1.0).recip();
+            let side = (30.0 + 188.0 * smooth) * scale_ui * crowding;
+            let aspect = 0.66 + 0.14 * smooth;
+            let rect = Rect::from_center_size(Pos2::new(px, py), Vec2::new(side, side * aspect));
+            let idx_f = scroll + (j as f32) * (n_f / vis_f);
+            let m = n as f32;
+            let u = idx_f.rem_euclid(m);
+            let pick = (u.floor() as usize).min(n.saturating_sub(1));
+            let strip_idx = indices[pick];
+            items.push((depth, strip_idx, rect));
+        }
+        items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        items
+    }
+
+    fn carousel_ring_step(
+        &mut self,
+        ctx: &Context,
+        response: &Response,
+        inner: Rect,
+        dt: f32,
+        pointer: Option<Pos2>,
+        primary_pressed: bool,
+        primary_released: bool,
+        dragging: bool,
+        space_down: bool,
+    ) {
+        if !self.carousel_ring_active() {
+            self.carousel_ring_vel = 0.0;
+            self.carousel_ring_drag_from_outer = false;
+            return;
+        }
+        if space_down || self.scribble_kind.is_some() {
+            return;
+        }
+        // 整块画布（含主图区域）均可拖动环轨；缩略图点击切图由 `carousel_ring_try_pick` 处理。
+        let ptr_steering = pointer.map(|p| inner.contains(p)).unwrap_or(false);
+        if primary_pressed && response.hovered() && ptr_steering {
+            self.carousel_ring_drag_from_outer = true;
+        }
+        if primary_released {
+            self.carousel_ring_drag_from_outer = false;
+        }
+        let sens = 0.011_f32;
+        let dt = dt.max(1e-4);
+        if dragging && self.carousel_ring_drag_from_outer {
+            let d = response.drag_delta();
+            let da = -d.x * sens;
+            self.carousel_ring_angle += da;
+            self.carousel_ring_vel = da / dt;
+        } else if !ctx.input(|i| i.pointer.primary_down()) {
+            self.carousel_ring_angle += self.carousel_ring_vel * dt;
+            // 略慢的指数衰减 + 低速时额外阻尼，惯性更顺、停得更柔。
+            let v = self.carousel_ring_vel.abs();
+            let decay = (-3.35_f32 * dt).exp() * if v < 0.045 { 0.88 + 0.12 * (v / 0.045) } else { 1.0 };
+            self.carousel_ring_vel *= decay;
+            if self.carousel_ring_vel.abs() < 0.0019 {
+                self.carousel_ring_vel = 0.0;
+            }
+        }
+        // 持续刷新：惯性滑行与正面卡片光晕呼吸。
+        ctx.request_repaint();
+        if self.carousel_ring_active()
+            && ptr_steering
+            && response.hovered()
+            && !space_down
+            && self.scribble_kind.is_none()
+        {
+            ctx.set_cursor_icon(if dragging && self.carousel_ring_drag_from_outer {
+                CursorIcon::Grabbing
+            } else {
+                CursorIcon::Grab
+            });
+        }
+    }
+
+    fn carousel_ring_try_pick(&mut self, ctx: &Context, inner: Rect, pointer: Option<Pos2>) {
+        if !self.carousel_ring_active() {
+            return;
+        }
+        if !ctx.input(|i| i.pointer.button_clicked(PointerButton::Primary)) {
+            return;
+        }
+        let Some(p) = pointer else {
+            return;
+        };
+        if !inner.contains(p) {
+            return;
+        }
+        let items = self.carousel_ring_items(inner);
+        for (_, strip_idx, rect) in items.into_iter().rev() {
+            if rect.contains(p) {
+                if strip_idx != self.current_index {
+                    let _ = self.save_current_labels();
+                    self.current_index = strip_idx;
+                    self.load_current_image();
+                }
+                ctx.request_repaint();
+                break;
+            }
+        }
+    }
+
+    fn carousel_ring_load_thumb(&mut self, ctx: &Context, path_idx: usize) {
+        if self.carousel_ring_tex.contains_key(&path_idx) {
+            return;
+        }
+        let Some(path) = self.image_paths.get(path_idx) else {
+            return;
+        };
+        let Ok(img) = image::open(path) else {
+            return;
+        };
+        let rgba = img.thumbnail(320, 320).to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let tex = ctx.load_texture(
+            format!("carousel_ring_{path_idx}"),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.carousel_ring_tex.insert(path_idx, tex);
+    }
+
+    fn paint_carousel_ring(&mut self, ctx: &Context, painter: &egui::Painter, inner: Rect) {
+        const HINT_DASH: f32 = 6.0;
+        const HINT_GAP: f32 = 5.0;
+        let hint_r = inner.shrink(10.0);
+        let hint_stroke = Stroke::new(
+            1.25,
+            color_alpha(theme::ACCENT, 72),
+        );
+        let mn = hint_r.min;
+        let mx = hint_r.max;
+        let top = [Pos2::new(mn.x, mn.y), Pos2::new(mx.x, mn.y)];
+        let right = [Pos2::new(mx.x, mn.y), Pos2::new(mx.x, mx.y)];
+        let bottom = [Pos2::new(mx.x, mx.y), Pos2::new(mn.x, mx.y)];
+        let left = [Pos2::new(mn.x, mx.y), Pos2::new(mn.x, mn.y)];
+        for seg in [&top[..], &right[..], &bottom[..], &left[..]] {
+            for s in Shape::dashed_line(seg, hint_stroke, HINT_DASH, HINT_GAP) {
+                painter.add(s);
+            }
+        }
+        let items = self.carousel_ring_items(inner);
+        if items.is_empty() {
+            let msg = match self.carousel_ring_pool {
+                CarouselRingPool::Annotated => "当前分组暂无已标注图片",
+                CarouselRingPool::Unannotated => "当前分组暂无未标注图片",
+            };
+            painter.text(
+                inner.center(),
+                Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(15.0),
+                theme::TEXT_MUTED,
+            );
+            painter.text(
+                inner.left_bottom() + Vec2::new(8.0, -48.0),
+                Align2::LEFT_BOTTOM,
+                "请用底部按钮切换「已标注 / 未标注」· 虚线内可拖动旋转",
+                egui::FontId::proportional(12.0),
+                theme::TEXT_MUTED,
+            );
+            return;
+        }
+        let mut budget = 24usize;
+        for &(_, strip_idx, _) in &items {
+            if budget == 0 {
+                break;
+            }
+            if !self.carousel_ring_tex.contains_key(&strip_idx) {
+                self.carousel_ring_load_thumb(ctx, strip_idx);
+                budget -= 1;
+            }
+        }
+        let t_anim = ctx.input(|i| i.time) as f32;
+        let breathe = 0.5 + 0.5 * (t_anim * 1.85).sin();
+        for (depth, strip_idx, rect) in items {
+            let smooth_d = (depth.clamp(0.0, 1.0)).powf(1.15);
+            let alpha =
+                (58 + (200.0 * ((smooth_d + 0.08) / 1.08).min(1.0)) as i32).clamp(0, 255) as u8;
+            let round = 6.0 + 5.0 * smooth_d;
+            // 阴影：仅中前层，随深度加重
+            if smooth_d > 0.22 {
+                let sh_off = Vec2::new(3.2 + smooth_d * 2.0, 5.0 + smooth_d * 3.5);
+                let sh_alpha = (18.0 + 55.0 * smooth_d.powf(1.1)) as u8;
+                painter.rect_filled(
+                    rect.translate(sh_off),
+                    round,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, sh_alpha),
+                );
+            }
+            let fill = Color32::from_rgba_unmultiplied(16, 20, 30, alpha);
+            painter.rect_filled(rect, round, fill);
+            let stroke_w = 1.15 + 1.35 * smooth_d;
+            painter.rect_stroke(
+                rect,
+                round,
+                Stroke::new(
+                    stroke_w,
+                    color_alpha(theme::ACCENT, (f32::from(alpha) * (0.5 + 0.22 * smooth_d)) as u8),
+                ),
+            );
+            // 最靠前的一张：呼吸光晕 + 内高光边
+            if smooth_d > 0.88 {
+                let glow = (34.0 + 38.0 * breathe * smooth_d) as u8;
+                painter.rect_stroke(
+                    rect.expand(2.5 + 1.2 * breathe),
+                    round + 2.0,
+                    Stroke::new(1.25 + 0.85 * breathe, color_alpha(theme::ACCENT, glow)),
+                );
+                let hi = color_alpha(Color32::WHITE, (22.0 + 28.0 * breathe) as u8);
+                painter.rect_stroke(
+                    rect.shrink(1.5),
+                    (round - 1.0).max(2.0),
+                    Stroke::new(1.0, hi),
+                );
+            }
+            let luma = (0.36 + 0.64 * smooth_d.powf(0.82)).clamp(0.0, 1.0);
+            let tint_g = (255.0 * luma) as u8;
+            let img_tint = Color32::from_rgb(tint_g, tint_g, tint_g);
+            if let Some(tex) = self.carousel_ring_tex.get(&strip_idx) {
+                let pad = 2.5 + 0.8 * (1.0 - smooth_d);
+                let img_rect = rect.shrink(pad);
+                painter.image(
+                    tex.id(),
+                    img_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    img_tint,
+                );
+            } else {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "…",
+                    egui::FontId::proportional(14.0),
+                    theme::TEXT_MUTED,
+                );
+            }
+        }
+        painter.text(
+            inner.left_bottom() + Vec2::new(8.0, -48.0),
+            Align2::LEFT_BOTTOM,
+            "大图集：环上为一段窗口，拖动旋转在整库中滚动（转一圈≈滚过一遍列表）· 底部切换已标/未标 · 点击切图",
+            egui::FontId::proportional(12.0),
+            theme::TEXT_MUTED,
+        );
     }
 
     fn go_to_image_index(&mut self, idx: usize) {
@@ -2043,6 +3453,7 @@ impl YoloTrainerApp {
         }
         let _ = self.save_current_labels();
         self.current_index = self.current_index.saturating_sub(1);
+        self.annotated_strip_step_scroll_pending = true;
         self.load_current_image();
     }
 
@@ -2052,6 +3463,7 @@ impl YoloTrainerApp {
         }
         let _ = self.save_current_labels();
         self.current_index += 1;
+        self.annotated_strip_step_scroll_pending = true;
         self.load_current_image();
     }
 
@@ -2083,10 +3495,22 @@ impl YoloTrainerApp {
         let Some(path) = self.image_paths.get(self.current_index) else {
             return;
         };
-        let Ok(img) = image::open(path) else {
-            return;
+        let rgba = if let Some(vs) = &self.video_session {
+            let Some(frame) = vs.frames.get(self.current_index) else {
+                self.train_log.push(format!(
+                    "[视频] 内存帧索引越界：{}/{}",
+                    self.current_index + 1,
+                    vs.frames.len()
+                ));
+                return;
+            };
+            frame.clone()
+        } else {
+            let Ok(img) = image::open(path) else {
+                return;
+            };
+            img.to_rgba8()
         };
-        let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         self.rgba = Some(rgba);
 
@@ -2095,12 +3519,13 @@ impl YoloTrainerApp {
         self.texture_dirty = true;
 
         let classes_len_before = self.classes.len();
-        let max_ann_id = self.annotations.iter().map(|b| b.class_id).max().unwrap_or(0);
-        while self.classes.len() <= max_ann_id {
-            let k = self.classes.len();
-            // 与 ONNX 槽位一致：缺省用 unknown_0 起，不改动 assist_class_names（尚未推理时）
-            self.classes.push(format!("unknown_{}", k));
-            self.class_colors.push(palette_color(k));
+        // 仅当当前图已有标注行时才扩展类别表，避免「尚未标注」就自动出现 unknown_0。
+        if let Some(max_ann_id) = self.annotations.iter().map(|b| b.class_id).max() {
+            while self.classes.len() <= max_ann_id {
+                let k = self.classes.len();
+                self.classes.push(format!("unknown_{}", k));
+                self.class_colors.push(palette_color(k));
+            }
         }
         if !self.classes.is_empty() {
             self.active_class_idx = self
@@ -2120,14 +3545,35 @@ impl YoloTrainerApp {
         let Some(arc) = self.assist_ort.clone() else {
             return;
         };
-        let Some(img_path) = self.image_paths.get(self.current_index).cloned() else {
-            return;
+        let use_in_memory = self.video_session.is_some();
+        let mem_rgba = if use_in_memory {
+            self.rgba.clone()
+        } else {
+            None
         };
+        let path_for_disk = if !use_in_memory {
+            self.image_paths.get(self.current_index).cloned()
+        } else {
+            None
+        };
+        if use_in_memory {
+            if mem_rgba.is_none() {
+                return;
+            }
+        } else {
+            let Some(p) = path_for_disk.as_ref() else {
+                return;
+            };
+            if !p.is_file() {
+                return;
+            }
+        }
         let _ = self.assist_rx.take();
         let (tx, rx) = mpsc::channel();
         self.assist_rx = Some(rx);
         self.assist_busy = true;
         let conf_min = self.assist_onnx_conf.clamp(0.0, 1.0);
+        let iou_nms = self.assist_onnx_iou.clamp(0.0, 1.0);
         thread::spawn(move || {
             let r = {
                 let mut ses = match arc.lock() {
@@ -2137,7 +3583,19 @@ impl YoloTrainerApp {
                         return;
                     }
                 };
-                onnx_assist::predict_with_session(&mut *ses, &img_path, conf_min)
+                if use_in_memory {
+                    let Some(ref img) = mem_rgba else {
+                        let _ = tx.send(Err("内部：无内存图像".to_string()));
+                        return;
+                    };
+                    onnx_assist::predict_with_session_rgba(&mut *ses, img, conf_min, iou_nms)
+                } else {
+                    let Some(p) = path_for_disk else {
+                        let _ = tx.send(Err("内部：无路径".to_string()));
+                        return;
+                    };
+                    onnx_assist::predict_with_session(&mut *ses, &p, conf_min, iou_nms)
+                }
             };
             let mapped = r.map(|v| {
                 v.into_iter()
@@ -2223,7 +3681,8 @@ impl YoloTrainerApp {
         self.annotations = load_annotations(&lbl, w, h);
     }
 
-    /// 将当前 ONNX 辅助框写入正式标注：若与任一已有框 IoU≥[`ASSIST_ADOPT_DUP_IOU`] 则跳过（保留原框）；否则追加。类别 id 与模型一致。
+    /// 将当前 ONNX 辅助框写入正式标注：若与任一已有框 IoU≥[`ASSIST_ADOPT_DUP_IOU`] 则跳过（保留原框）；否则追加。
+    /// 类别名按辅助栏中的 `unknown_*`（与模型 id 对应）在 `class_log` **末尾**独占新行，不占用已有手动类别索引。
     fn adopt_onnx_assist_to_annotations(&mut self) {
         let Some(img) = &self.rgba else {
             self.train_log
@@ -2235,7 +3694,7 @@ impl YoloTrainerApp {
         }
         let (w, h) = img.dimensions();
         let names_len = self.assist_class_names.len();
-        let candidates = build_adopt_candidates(
+        let mut candidates = build_adopt_candidates(
             &self.assist_preds,
             &self.assist_pred_class_on,
             names_len,
@@ -2250,28 +3709,21 @@ impl YoloTrainerApp {
         }
 
         self.push_undo(UndoScope::Local);
-        let adopted_ids: HashSet<usize> = candidates.iter().map(|c| c.class_id).collect();
+        let classes_len_before = self.classes.len();
+        let assist_names = self.assist_class_names.clone();
+        for c in &mut candidates {
+            c.class_id = dataset_index_for_onnx_adopt_name(
+                &mut self.classes,
+                c.class_id,
+                &assist_names,
+            );
+        }
         let (merged, added, skipped_iou) =
             adopt_merge_candidates(self.annotations.clone(), candidates);
         self.annotations = merged;
 
-        let classes_len_before = self.classes.len();
-        let max_cid = self
-            .annotations
-            .iter()
-            .map(|b| b.class_id)
-            .max()
-            .unwrap_or(0);
-        self.ensure_assist_unknown_names(max_cid.saturating_add(1));
-        // 只「新追加」的类别槽写名：采纳的模型 id 用 unknown_*；其余新槽用 class_k，避免覆盖已有 class_log。
-        while self.classes.len() <= max_cid {
-            let k = self.classes.len();
-            let name = if adopted_ids.contains(&k) {
-                self.assist_slot_class_name(k)
-            } else {
-                format!("class_{k}")
-            };
-            self.classes.push(name);
+        while self.class_colors.len() < self.classes.len() {
+            let k = self.class_colors.len();
             self.class_colors.push(palette_color(k));
         }
         if !self.classes.is_empty() {
@@ -2309,8 +3761,11 @@ impl YoloTrainerApp {
         self.push_undo(UndoScope::DatasetLabels);
         let paths = self.image_paths.clone();
         let conf = self.assist_onnx_conf.clamp(0.0, 1.0);
+        let iou_nms = self.assist_onnx_iou.clamp(0.0, 1.0);
         let mask = self.assist_pred_class_on.clone();
         let names_len = self.assist_class_names.len();
+        let assist_names = self.assist_class_names.clone();
+        let initial_classes = self.classes.clone();
         let (tx, rx) = mpsc::channel();
         self.assist_batch_rx = Some(rx);
         self.assist_batch_busy = true;
@@ -2318,13 +3773,12 @@ impl YoloTrainerApp {
         self.assist_busy = false;
 
         thread::spawn(move || {
+            let mut classes_acc = initial_classes;
             let mut images_scanned = 0usize;
             let mut images_open_failed = 0usize;
             let mut infer_failed = 0usize;
             let mut total_added = 0usize;
             let mut total_skipped_iou = 0usize;
-            let mut max_class_id = 0usize;
-            let mut had_any_box = false;
 
             for path in paths {
                 images_scanned += 1;
@@ -2345,7 +3799,7 @@ impl YoloTrainerApp {
                             return;
                         }
                     };
-                    onnx_assist::predict_with_session(&mut *ses, &path, conf)
+                    onnx_assist::predict_with_session(&mut *ses, &path, conf, iou_nms)
                 };
                 let Ok(detections) = infer_result else {
                     infer_failed += 1;
@@ -2362,16 +3816,17 @@ impl YoloTrainerApp {
                         conf: d.conf,
                     })
                     .collect();
-                let candidates = build_adopt_candidates(&preds, &mask, names_len, w, h);
+                let mut candidates = build_adopt_candidates(&preds, &mask, names_len, w, h);
+                for c in &mut candidates {
+                    c.class_id = dataset_index_for_onnx_adopt_name(
+                        &mut classes_acc,
+                        c.class_id,
+                        &assist_names,
+                    );
+                }
                 let (merged, added, skipped) = adopt_merge_candidates(existing, candidates);
                 total_added += added;
                 total_skipped_iou += skipped;
-                if !merged.is_empty() {
-                    had_any_box = true;
-                }
-                for b in &merged {
-                    max_class_id = max_class_id.max(b.class_id);
-                }
                 if let Err(e) = save_annotations(&lbl, &merged, w, h) {
                     let _ = tx.send(Err(format!("写入 {}: {e}", lbl.display())));
                     return;
@@ -2384,8 +3839,7 @@ impl YoloTrainerApp {
                 infer_failed,
                 total_added,
                 total_skipped_iou,
-                max_class_id,
-                had_any_box,
+                classes_after: classes_acc,
             }));
         });
     }
@@ -2398,17 +3852,21 @@ impl YoloTrainerApp {
             Ok(Ok(sum)) => {
                 self.assist_batch_rx = None;
                 self.assist_batch_busy = false;
-                if sum.had_any_box {
-                    let cb = self.classes.len();
-                    self.ensure_assist_unknown_names(sum.max_class_id.saturating_add(1));
-                    while self.classes.len() <= sum.max_class_id {
-                        let k = self.classes.len();
-                        self.classes.push(self.assist_slot_class_name(k));
-                        self.class_colors.push(palette_color(k));
-                    }
-                    if self.classes.len() != cb {
-                        self.mark_class_log_dirty();
-                    }
+                let old_classes = self.classes.clone();
+                let old_colors = self.class_colors.clone();
+                self.classes = sum.classes_after;
+                self.class_colors.resize(self.classes.len(), Color32::TRANSPARENT);
+                for i in 0..self.classes.len() {
+                    self.class_colors[i] = if i < old_colors.len() && i < old_classes.len()
+                        && old_classes.get(i) == self.classes.get(i)
+                    {
+                        old_colors[i]
+                    } else {
+                        palette_color(i)
+                    };
+                }
+                if self.classes != old_classes {
+                    self.mark_class_log_dirty();
                 }
                 if !self.classes.is_empty() {
                     self.active_class_idx = self
@@ -2446,11 +3904,6 @@ impl YoloTrainerApp {
         }
     }
 
-    fn current_label_path(&self) -> Option<PathBuf> {
-        let path = self.image_paths.get(self.current_index)?;
-        Some(label_txt_path_for_image(path))
-    }
-
     fn active_class_label_draft(&self) -> String {
         self.classes
             .get(self.active_class_idx.min(self.classes.len().saturating_sub(1)))
@@ -2458,15 +3911,57 @@ impl YoloTrainerApp {
             .unwrap_or_default()
     }
 
+    /// 当前图无框时，写入**空**与图同名的 `.txt`，作为 YOLO 负样本；若已有实框或已是负样本则不起作用。
+    fn mark_current_image_as_negative_sample(&mut self) -> std::io::Result<()> {
+        if !self.annotations.is_empty() {
+            return Ok(());
+        }
+        let Some(p) = self.image_paths.get(self.current_index) else {
+            return Ok(());
+        };
+        if path_has_nonempty_label_file(p) {
+            return Ok(());
+        }
+        if path_is_negative_label_only(p) {
+            return Ok(());
+        }
+        let txt = label_txt_path_for_image(p);
+        if let Some(dir) = txt.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(&txt, "")?;
+        self.mark_annotated_strip_dirty();
+        Ok(())
+    }
+
     fn save_current_labels(&mut self) -> std::io::Result<()> {
         let Some(img) = &self.rgba else {
             return Ok(());
         };
         let (w, h) = img.dimensions();
-        let Some(lbl) = self.current_label_path() else {
+        let Some(img_path) = self.image_paths.get(self.current_index) else {
             return Ok(());
         };
-        save_annotations(&lbl, &self.annotations, w, h)?;
+        let lbl = label_txt_path_for_image(img_path);
+        if self.video_session.is_some() {
+            if self.annotations.is_empty() {
+                // 负样本：仅空 .txt，不删，保留训练时的「无目标」
+                if !path_is_negative_label_only(img_path) {
+                    let _ = fs::remove_file(&lbl);
+                }
+                let _ = fs::remove_file(img_path);
+            } else {
+                if let Some(parent) = img_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                DynamicImage::ImageRgba8(img.clone())
+                    .save(img_path)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                save_annotations(&lbl, &self.annotations, w, h)?;
+            }
+        } else {
+            save_annotations(&lbl, &self.annotations, w, h)?;
+        }
         self.mark_annotated_strip_dirty();
         Ok(())
     }
@@ -2901,6 +4396,30 @@ impl YoloTrainerApp {
         self.draw_phase = DrawPhase::Idle;
     }
 
+    /// 关闭标签窗：编辑已有框时仅取消本次改名；新框待命名时直接丢弃未确认的框。
+    fn cancel_label_dialog(&mut self) {
+        if let Some(idx) = self.label_edit_idx.take() {
+            if idx < self.annotations.len() {
+                let cid = self.annotations[idx].class_id;
+                self.label_draft = self
+                    .classes
+                    .get(cid)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        } else {
+            self.pending_box = None;
+            self.pending_boxes_batch.clear();
+            self.scribble_closed_boxes.clear();
+            self.scribble_active = false;
+            self.scribble_points.clear();
+            self.scribble_open_start = 0;
+            self.label_draft = self.active_class_label_draft();
+        }
+        self.show_label_window = false;
+        self.draw_phase = DrawPhase::Idle;
+    }
+
     fn corner_points(b: &Bbox) -> [Pos2; 4] {
         [
             Pos2::new(b.min_x, b.min_y),
@@ -2964,6 +4483,45 @@ impl YoloTrainerApp {
     fn hit_inside(p_img: (f32, f32), b: &Bbox) -> bool {
         let (x, y) = p_img;
         x >= b.min_x && x <= b.max_x && y >= b.min_y && y <= b.max_y
+    }
+
+    fn overlap_stack_indices_at(&self, p_img: (f32, f32)) -> Vec<usize> {
+        let mut hits: Vec<usize> = self
+            .annotations
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, b)| Self::hit_inside(p_img, b).then_some(idx))
+            .collect();
+        hits.sort_by(|&a, &b| {
+            let area_a = (self.annotations[a].max_x - self.annotations[a].min_x)
+                * (self.annotations[a].max_y - self.annotations[a].min_y);
+            let area_b = (self.annotations[b].max_x - self.annotations[b].min_x)
+                * (self.annotations[b].max_y - self.annotations[b].min_y);
+            area_b
+                .partial_cmp(&area_a)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.cmp(&b))
+        });
+        hits
+    }
+
+    fn cycle_overlap_selection_at(&mut self, p_img: (f32, f32), toward_inner: bool) -> bool {
+        let stack = self.overlap_stack_indices_at(p_img);
+        if stack.is_empty() {
+            return false;
+        }
+        let next_idx = match self
+            .selected
+            .and_then(|selected| stack.iter().position(|&idx| idx == selected))
+        {
+            Some(pos) if toward_inner => stack[(pos + 1).min(stack.len() - 1)],
+            Some(pos) if pos > 0 => stack[pos - 1],
+            Some(_) => stack[0],
+            None => stack[0],
+        };
+        self.selected = Some(next_idx);
+        self.drag = None;
+        true
     }
 
     /// F 模式：最新边与更早某条非相邻边相交则形成视觉闭合块；嵌套时只保留最大圈（见 `polygon_contains_polygon`）。
@@ -3131,7 +4689,7 @@ impl YoloTrainerApp {
         };
         match backend {
             TrainingBackend::Conda => {
-                let root = self.selected_conda_root();
+                let root = self.resolved_conda_root();
                 if root.is_empty() {
                     self.train_log.push(
                         "[错误] 请先在「训练环境设定」中选择 Conda 环境（或点击刷新环境列表）。"
@@ -3139,7 +4697,7 @@ impl YoloTrainerApp {
                     );
                     return;
                 }
-                let py = conda_python_executable(Path::new(root));
+                let py = conda_python_executable(Path::new(&root));
                 if !py.is_file() {
                     self.train_log.push(format!(
                         "[错误] 未找到 Python: {} （请确认所选为 Conda 环境根目录，内含 python.exe）",
@@ -3334,99 +4892,871 @@ impl YoloTrainerApp {
         }
     }
 
-    /// 已写入标签的图片列表（相对根目录路径，点击切换当前图）。
-    fn ui_annotated_strip(&mut self, ui: &mut Ui) {
+    fn poll_video_load(&mut self, ctx: &Context) {
+        let Some(rx) = self.video_load_rx.as_ref() else {
+            return;
+        };
+        let mut done: Option<Result<VideoLoadResult, String>> = None;
+        let mut changed = false;
+        while let Ok(msg) = rx.try_recv() {
+            changed = true;
+            match msg {
+                VideoLoadMsg::Status { text, progress } => {
+                    self.video_load_status = text;
+                    self.video_load_progress = progress.clamp(0.0, 0.99);
+                }
+                VideoLoadMsg::Done(result) => done = Some(result),
+            }
+        }
+
+        if let Some(result) = done {
+            self.video_load_rx = None;
+            self.video_load_busy = false;
+            self.video_load_progress = 1.0;
+            match result {
+                Ok(result) => {
+                    let n_frames = result.frames.len();
+                    let mut paths = Vec::with_capacity(n_frames);
+                    for i in 0..n_frames {
+                        paths.push(result.out_dir.join(format!(
+                            "{}_{:06}.jpg",
+                            result.stem,
+                            i + 1
+                        )));
+                    }
+                    self.image_root = result.out_dir.clone();
+                    self.video_session = Some(VideoSession {
+                        stem: result.stem.clone(),
+                        frames: result.frames,
+                    });
+                    // 同目录可有多路视频，类别表按 `class_log_{stem}.txt` 区分；与选图片目录一样从磁盘恢复
+                    self.load_class_log_from_disk();
+                    self.image_paths = paths;
+                    self.current_index = 0;
+                    self.mark_annotated_strip_dirty();
+                    self.reset_canvas_runtime_cache();
+                    self.load_current_image();
+                    self.video_load_status = "载入完成".to_string();
+                    self.train_log.push(format!(
+                        "[视频] 已载入 {} · 共 {} 帧 @ {:.2} fps。同目录输出 {}_######.jpg + .txt；仅保存过标注的帧会落盘。",
+                        result.video_path.display(),
+                        n_frames,
+                        result.fps,
+                        result.stem,
+                    ));
+                }
+                Err(e) => {
+                    self.video_load_status = "载入失败".to_string();
+                    self.train_log.push(format!("[视频] {e}"));
+                }
+            }
+            changed = true;
+        }
+
+        if changed || self.video_load_busy {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 顶栏中部：上一张A / 下一张D / 刷新、进度与统计芯片（当前文件名在左侧已标注标题行）。
+    fn ui_top_bar_image_nav(&mut self, ui: &mut Ui) {
+        let total_images = self.image_paths.len();
+        let current_idx = if total_images == 0 {
+            0
+        } else {
+            self.current_index + 1
+        };
+        Frame::default()
+            .fill(theme::SURFACE_ELEVATED)
+            .inner_margin(egui::Margin::same(8.0))
+            .rounding(egui::Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                // 本卡可用宽；子块用同一 block_w 居中，使上排三键/四统计/下两格+开路径 左缘右缘对齐，且略短于全宽。
+                let row_w = ui.available_width().max(1.0);
+                let block_w = (row_w * 0.86).min(row_w).max(100.0);
+                let h_pad = ((row_w - block_w) * 0.5).max(0.0);
+                ui.horizontal(|ui| {
+                    if h_pad > 0.0 {
+                        ui.add_space(h_pad);
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(block_w);
+                        let btn_gap = 6.0_f32;
+                        let action_w = ((block_w - 2.0 * btn_gap) / 3.0).max(40.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(btn_gap, 0.0);
+                            for v in &mut self.image_nav_btn_fx {
+                                *v *= 0.84;
+                                if *v < 0.008 {
+                                    *v = 0.0;
+                                }
+                            }
+                            if self.image_nav_btn_fx[0] + self.image_nav_btn_fx[1] > 0.002 {
+                                ui.ctx().request_repaint();
+                            }
+                            let prev = ui
+                                .add_enabled(
+                                    self.current_index > 0,
+                                    egui::Button::new(
+                                        RichText::new("上一张A").small().strong(),
+                                    )
+                                    .min_size(Vec2::new(action_w, 24.0)),
+                                )
+                                .on_hover_text("切到上一张图片 / 上一帧");
+                            if prev.clicked() {
+                                self.image_nav_btn_fx[0] = 1.0;
+                                self.go_prev_image();
+                            }
+
+                            let next = ui
+                                .add_enabled(
+                                    !self.image_paths.is_empty()
+                                        && self.current_index + 1
+                                            < self.image_paths.len(),
+                                    egui::Button::new(
+                                        RichText::new("下一张D").small().strong(),
+                                    )
+                                    .min_size(Vec2::new(action_w, 24.0)),
+                                )
+                                .on_hover_text("切到下一张图片 / 下一帧");
+                            if next.clicked() {
+                                self.image_nav_btn_fx[1] = 1.0;
+                                self.go_next_image();
+                            }
+
+                            let refresh = ui
+                                .add_sized(
+                                    Vec2::new(action_w, 24.0),
+                                    egui::Button::new(
+                                        RichText::new("刷新列表").small().strong(),
+                                    ),
+                                )
+                                .on_hover_text("重新扫描目录，并刷新顶部已标注文件列表");
+                            if refresh.clicked() {
+                                self.refresh_image_list();
+                            }
+
+                            let t0 = self.image_nav_btn_fx[0];
+                            if t0 > 0.001 {
+                                let g = 1.0 + 2.5 * t0;
+                                ui.painter().rect_stroke(
+                                    prev.rect.expand(g),
+                                    10.0,
+                                    Stroke::new(
+                                        0.75 + 1.8 * t0,
+                                        color_alpha(
+                                            theme::ACCENT,
+                                            (12.0 + 185.0 * t0) as u8,
+                                        ),
+                                    ),
+                                );
+                            }
+                            let t1 = self.image_nav_btn_fx[1];
+                            if t1 > 0.001 {
+                                let g = 1.0 + 2.5 * t1;
+                                ui.painter().rect_stroke(
+                                    next.rect.expand(g),
+                                    10.0,
+                                    Stroke::new(
+                                        0.75 + 1.8 * t1,
+                                        color_alpha(
+                                            theme::OK,
+                                            (12.0 + 185.0 * t1) as u8,
+                                        ),
+                                    ),
+                                );
+                            }
+                        });
+                        // 与 block_w 右缘对齐：芯片内层 max_w 之外还有 Frame 左右内边距(各 4)，
+                        // 必须摊进总宽，否则会整体比下方「图片目录/开路径」多出一截。
+                        let stat_gap = 4.0_f32;
+                        let frame_hpad = 4.0_f32 * 2.0; // 每枚 `compact_metric_tile` 左+右内边距
+                        let stat_w = (block_w
+                            - stat_gap * 3.0
+                            - 4.0 * frame_hpad)
+                            * 0.25;
+                        let stat_w = stat_w.max(1.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(block_w);
+                            ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = stat_gap;
+                            compact_metric_tile(
+                                ui,
+                                stat_w,
+                                "进度",
+                                &format!("{current_idx}/{total_images}"),
+                                theme::ACCENT,
+                            );
+                            compact_metric_tile(
+                                ui,
+                                stat_w,
+                                "本图",
+                                &format!("{} 框", self.annotations.len()),
+                                theme::OK,
+                            );
+                            compact_metric_tile(
+                                ui,
+                                stat_w,
+                                "已标注",
+                                &self.annotated_strip_indices.len().to_string(),
+                                theme::WARN,
+                            );
+                            compact_metric_tile(
+                                ui,
+                                stat_w,
+                                "类别",
+                                &self.classes.len().to_string(),
+                                theme::ACCENT,
+                            );
+                            });
+                        });
+                        ui.add_space(2.0);
+                        self.ui_source_picker_pair(ui, block_w, 26.0);
+                    });
+                    if h_pad > 0.0 {
+                        ui.add_space(h_pad);
+                    }
+                });
+            });
+    }
+
+    fn ui_source_picker_pair(&mut self, ui: &mut Ui, width: f32, height: f32) {
+        let width = width.min(ui.available_width().max(1.0)).max(120.0);
+        let row_gap = 6.0_f32;
+        let col_gap = 6.0_f32.min((width * 0.06).max(4.0));
+        let total_h = height * 2.0 + row_gap;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, total_h), Sense::hover());
+        let half_w = ((width - col_gap) * 0.5).max(1.0);
+        let left_rect = Rect::from_min_size(rect.min, Vec2::new(half_w, height));
+        let right_rect = Rect::from_min_size(
+            Pos2::new(left_rect.right() + col_gap, rect.top()),
+            Vec2::new(half_w, height),
+        );
+        let open_rect = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.top() + height + row_gap),
+            Vec2::new(width, height),
+        );
+
+        let image_mode_active = self.video_session.is_none() && !self.video_load_busy;
+        let video_mode_active = self.video_session.is_some() || self.video_load_busy;
+        let current_mode_accent = if video_mode_active {
+            Color32::from_rgb(94, 164, 255)
+        } else {
+            Color32::from_rgb(120, 218, 145)
+        };
+        let can_open_path = self.image_root.is_dir()
+            && (self.video_session.is_some()
+                || !self.image_paths.is_empty()
+                || self.image_root.to_string_lossy() != ".");
+
+        let time_s = ui.input(|i| i.time) as f32;
+        let entry_attention = self.image_paths.is_empty()
+            && self.video_session.is_none()
+            && !self.video_load_busy;
+        // 已选过图/视频/正在载入 后才启用 W/S 式动效；冷启动未加载时两键不播特效
+        let has_media = !self.image_paths.is_empty()
+            || self.video_session.is_some()
+            || self.video_load_busy;
+        let left_fx = has_media && (entry_attention || image_mode_active);
+        let right_fx = has_media && (entry_attention || video_mode_active);
+        if left_fx || right_fx {
+            ui.ctx().request_repaint();
+        }
+        let img_tip = if entry_attention {
+            "【由此开始】选文件夹加载图片。\n载入所选目录内一层图片；若该层无图但存在 data.yaml，则按 train/val 子目录加载。"
+        } else {
+            "载入所选目录内一层图片；若该层无图但存在 data.yaml，则按 train/val 子目录加载。"
+        };
+        let vid_tip = if entry_attention {
+            "【由此开始】选视频做逐帧标注。\n逐帧标注视频：需 FFmpeg。仅保存过标注的帧会写入同目录 jpg + txt。"
+        } else {
+            "逐帧标注视频：需 FFmpeg。仅保存过标注的帧会写入同目录 jpg + txt。"
+        };
+
+        let img_id = ui.id().with("pick_image_dir_segment");
+        let vid_id = ui.id().with("pick_video_file_segment");
+        let open_id = ui.id().with("open_current_root_segment");
+        let img_resp = ui
+            .interact(left_rect, img_id, Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(img_tip);
+        let vid_resp = ui
+            .interact(right_rect, vid_id, Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(vid_tip);
+        let mut open_resp = ui.interact(
+            open_rect,
+            open_id,
+            if can_open_path {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        open_resp = if can_open_path {
+            open_resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(format!("打开当前路径：{}", self.image_root.display()))
+        } else {
+            open_resp.on_hover_text("先选择图片目录或视频文件")
+        };
+
+        // 图片目录 / 视频：紫底/蓝底；文字黑粗；动效见 has_media
+        Self::paint_source_picker_button(
+            ui,
+            left_rect,
+            &img_resp,
+            img_id,
+            "图片目录",
+            Color32::from_rgb(88, 48, 120),
+            Color32::from_rgb(190, 150, 255),
+            image_mode_active,
+            time_s,
+            left_fx,
+            0.0_f32,
+        );
+        Self::paint_source_picker_button(
+            ui,
+            right_rect,
+            &vid_resp,
+            vid_id,
+            "视频文件",
+            Color32::from_rgb(48, 81, 132),
+            Color32::from_rgb(112, 172, 255),
+            video_mode_active,
+            time_s,
+            right_fx,
+            1.1_f32,
+        );
+        Self::paint_source_aux_button(
+            ui,
+            open_rect,
+            &open_resp,
+            open_id,
+            "打开当前路径",
+            current_mode_accent,
+            can_open_path,
+        );
+
+        if img_resp.clicked() {
+            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                self.switch_image_root(p);
+            }
+        }
+        if vid_resp.clicked() {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter(
+                    "视频",
+                    &["mp4", "avi", "mov", "mkv", "webm", "wmv", "m4v", "mpeg", "mpg"],
+                )
+                .pick_file()
+            {
+                self.load_video_session(p);
+            }
+        }
+        if can_open_path && open_resp.clicked() {
+            self.open_current_root_in_explorer();
+        }
+    }
+
+    fn open_current_root_in_explorer(&mut self) {
+        let target = if self.image_root.is_dir() {
+            self.image_root.clone()
+        } else if let Some(parent) = self.image_root.parent() {
+            parent.to_path_buf()
+        } else {
+            return;
+        };
+
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("explorer");
+            c.arg(&target);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("xdg-open");
+            c.arg(&target);
+            c
+        };
+        command_hide_console(&mut cmd);
+        if let Err(err) = cmd.spawn() {
+            self.train_log.push(format!(
+                "[路径] 打开失败：{} ({err})",
+                target.display()
+            ));
+        }
+    }
+
+    fn paint_source_picker_button(
+        ui: &Ui,
+        rect: Rect,
+        response: &Response,
+        id: Id,
+        text: &str,
+        fill: Color32,
+        accent: Color32,
+        selected: bool,
+        time_s: f32,
+        fx_active: bool,
+        entry_phase: f32,
+    ) {
+        let hover = ui
+            .ctx()
+            .animate_bool_responsive(id.with("hover"), response.hovered());
+        let down = ui.ctx().animate_bool_responsive(
+            id.with("down"),
+            response.is_pointer_button_down_on(),
+        );
+        let selected_t = ui
+            .ctx()
+            .animate_bool_responsive(id.with("selected"), selected);
+        if hover > 0.001 || down > 0.001 || selected_t > 0.001 || fx_active {
+            ui.ctx().request_repaint();
+        }
+
+        let att_breathe = if fx_active {
+            0.5 + 0.5 * (time_s * 2.1 + entry_phase).sin()
+        } else {
+            0.0
+        };
+        let att_flicker = if fx_active {
+            0.5 + 0.5 * (time_s * 3.4 + entry_phase * 1.3).cos()
+        } else {
+            0.0
+        };
+
+        let painter = ui.painter();
+        let draw_rect = rect.translate(Vec2::new(0.0, down * 1.0));
+        if fx_active {
+            // 双层呼吸外晕
+            let wob = 3.2 * att_breathe;
+            for (k, a_mul) in [(0.0_f32, 1.0), (0.5 * std::f32::consts::PI, 0.6)] {
+                let ph = 0.5 + 0.5 * (time_s * 1.9 + entry_phase + k).sin();
+                let er = 2.0 + wob + 4.5 * (1.0 - ph) * a_mul;
+                let ring = draw_rect.expand2(Vec2::new(er, er * 0.7));
+                painter.rect_filled(
+                    ring,
+                    10.0,
+                    color_alpha(
+                        accent,
+                        ((9.0 + 38.0 * ph * a_mul) * a_mul) as u8,
+                    ),
+                );
+            }
+        }
+        let glow = draw_rect.expand2(Vec2::new(1.5 + hover * 1.8, 1.0 + hover * 0.8));
+        painter.rect_filled(
+            glow,
+            9.0,
+            color_alpha(
+                accent,
+                (10.0
+                    + hover * 18.0
+                    + selected_t * 34.0
+                    + if fx_active {
+                        8.0 + 22.0 * att_breathe
+                    } else {
+                        0.0
+                    }) as u8,
+            ),
+        );
+
+        let base = if selected {
+            Color32::from_rgb(
+                fill.r().saturating_add(8),
+                fill.g().saturating_add(8),
+                fill.b().saturating_add(8),
+            )
+        } else {
+            fill
+        };
+        painter.rect_filled(draw_rect, 8.0, base);
+        if fx_active {
+            painter.with_clip_rect(draw_rect).rect_filled(
+                draw_rect,
+                8.0,
+                color_alpha(
+                    Color32::WHITE,
+                    (6.0 + 9.0 * att_flicker) as u8,
+                ),
+            );
+        }
+        painter.rect_filled(
+            draw_rect,
+            8.0,
+            color_alpha(accent, (14.0 + hover * 10.0 + selected_t * 26.0) as u8),
+        );
+        if fx_active {
+            // 扫过高光带
+            let s = (time_s * 0.55 + entry_phase * 0.08).rem_euclid(1.0);
+            let w = draw_rect.width();
+            let sheen_l = draw_rect.left() - 0.25 * w + s * (w * 1.5);
+            let sheen = Rect::from_min_max(
+                Pos2::new(sheen_l, draw_rect.top() + 1.0),
+                Pos2::new(
+                    (sheen_l + w * 0.3).min(draw_rect.right() + 4.0),
+                    draw_rect.bottom() - 1.0,
+                ),
+            );
+            painter.with_clip_rect(draw_rect).rect_filled(
+                sheen,
+                7.0,
+                color_alpha(Color32::from_rgb(255, 255, 255), (7 + (18.0 * att_breathe) as u8) as u8),
+            );
+        }
+        painter.rect_filled(
+            draw_rect,
+            8.0,
+            color_alpha(Color32::BLACK, (8.0 + down * 24.0) as u8),
+        );
+        let stroke_w = 1.0
+            + hover * 0.35
+            + selected_t * 0.75
+            + if fx_active {
+                0.4 + 0.55 * att_breathe
+            } else {
+                0.0
+            };
+        let stroke_bright = 96.0
+            + hover * 34.0
+            + selected_t * 84.0
+            + if fx_active {
+                12.0 + 55.0 * att_flicker
+            } else {
+                0.0
+            };
+        painter.rect_stroke(
+            draw_rect,
+            8.0,
+            Stroke::new(
+                stroke_w,
+                color_alpha(accent, stroke_bright as u8),
+            ),
+        );
+        if fx_active {
+            // 外缘霓虹
+            let neon = draw_rect.expand(1.2 + 1.5 * (0.5 + 0.5 * (time_s * 2.0 + entry_phase).sin()));
+            let na = (28.0 + 80.0 * (0.5 + 0.5 * (time_s * 2.8 + entry_phase * 0.5).sin())) as u8;
+            painter.rect_stroke(
+                neon,
+                8.0,
+                Stroke::new(1.0, color_alpha(accent, na)),
+            );
+        }
+
+        // 单选式标识：仅当前模式为「本键」时显示在文字前；未选中的模式不画
+        let text_left = if selected {
+            let r_center = Pos2::new(draw_rect.left() + 10.0, draw_rect.center().y);
+            let r_outer = 4.2 + selected_t * 0.3;
+            painter.circle_filled(
+                r_center,
+                r_outer,
+                color_alpha(
+                    Color32::from_rgb(8, 10, 16),
+                    (200.0 + hover * 20.0) as u8,
+                ),
+            );
+            painter.circle_stroke(
+                r_center,
+                r_outer,
+                Stroke::new(1.1, color_alpha(accent, (140.0 + hover * 30.0 + selected_t * 50.0) as u8)),
+            );
+            painter.circle_filled(
+                r_center,
+                1.6 + selected_t * 0.3,
+                color_alpha(accent, (230.0 + hover * 15.0) as u8),
+            );
+            if fx_active {
+                let glow_r = 3.0 + 1.0 * (0.5 + 0.5 * (time_s * 2.5 + entry_phase).sin());
+                let ga = (45.0 + 55.0 * att_breathe) as u8;
+                painter.circle_filled(
+                    r_center,
+                    glow_r,
+                    color_alpha(accent, ga / 2),
+                );
+            }
+            draw_rect.left() + 23.0
+        } else {
+            draw_rect.left() + 9.0
+        };
+
+        // 黑、加粗感：同位置微偏移多次叠字（无单独粗字重字体时等效于粗体）
+        let tpos = Pos2::new(text_left, draw_rect.center().y);
+        let tfont = egui::FontId::proportional(14.0);
+        let tcol = Color32::from_rgb(0, 0, 0);
+        for o in [
+            Vec2::ZERO,
+            Vec2::new(0.45, 0.0),
+            Vec2::new(0.0, 0.45),
+            Vec2::new(0.45, 0.45),
+        ] {
+            painter.text(
+                tpos + o,
+                Align2::LEFT_CENTER,
+                text,
+                tfont.clone(),
+                tcol,
+            );
+        }
+    }
+
+    fn paint_source_aux_button(
+        ui: &Ui,
+        rect: Rect,
+        response: &Response,
+        id: Id,
+        text: &str,
+        accent: Color32,
+        enabled: bool,
+    ) {
+        let hover = ui
+            .ctx()
+            .animate_bool_responsive(id.with("hover"), response.hovered() && enabled);
+        let down = ui.ctx().animate_bool_responsive(
+            id.with("down"),
+            response.is_pointer_button_down_on() && enabled,
+        );
+        if hover > 0.001 || down > 0.001 {
+            ui.ctx().request_repaint();
+        }
+
+        let painter = ui.painter();
+        let draw_rect = rect.translate(Vec2::new(0.0, down * 1.0));
+        let base = if enabled {
+            Color32::from_rgb(29, 36, 46)
+        } else {
+            Color32::from_rgb(25, 30, 38)
+        };
+        painter.rect_filled(draw_rect, 8.0, base);
+        painter.rect_filled(
+            draw_rect,
+            8.0,
+            color_alpha(accent, (if enabled { 10.0 } else { 4.0 } + hover * 14.0) as u8),
+        );
+        painter.rect_stroke(
+            draw_rect,
+            8.0,
+            Stroke::new(
+                1.0 + hover * 0.35,
+                if enabled {
+                    color_alpha(accent, (92.0 + hover * 52.0) as u8)
+                } else {
+                    color_alpha(theme::BORDER_SUBTLE, 220)
+                },
+            ),
+        );
+
+        let badge = Pos2::new(draw_rect.left() + 13.0, draw_rect.center().y);
+        painter.circle_filled(
+            badge,
+            4.0 + hover * 0.6,
+            if enabled {
+                color_alpha(accent, 180)
+            } else {
+                color_alpha(theme::TEXT_MUTED, 92)
+            },
+        );
+        painter.circle_stroke(
+            Pos2::new(draw_rect.right() - 13.0, draw_rect.center().y),
+            5.0 + hover * 0.6,
+            Stroke::new(
+                1.0,
+                if enabled {
+                    color_alpha(accent, 170)
+                } else {
+                    color_alpha(theme::TEXT_MUTED, 72)
+                },
+            ),
+        );
+        painter.text(
+            Pos2::new(draw_rect.left() + 26.0, draw_rect.center().y),
+            Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(13.0),
+            if enabled {
+                theme::TEXT
+            } else {
+                theme::TEXT_MUTED
+            },
+        );
+    }
+
+    /// 顶栏：已标注文件名列表（紧凑行高，点击切换当前图）。
+    fn ui_annotated_strip_top_bar(&mut self, ui: &mut Ui, bar_h: f32) {
+        let title_h = 18.0_f32;
+        let list_h = (bar_h - title_h - 6.0).max(36.0);
+        let (cur_disp_name, cur_hover_path) = self
+            .image_paths
+            .get(self.current_index)
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                (name, p.display().to_string())
+            })
+            .unwrap_or_else(|| ("（未加载）".to_string(), String::new()));
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(
-                RichText::new(format!("已标注图片 {}", self.annotated_strip_indices.len()))
+                RichText::new(format!("已标注 {}", self.annotated_strip_indices.len()))
                     .small()
                     .strong()
                     .color(theme::TEXT),
             );
             ui.label(
-                RichText::new("点击文件名可快速切换，✓ 表示当前图片")
+                RichText::new("点击切换 · ✓ 当前")
                     .small()
                     .color(theme::TEXT_MUTED),
             );
-        });
-        ui.add_space(6.0);
-        app_card(theme::SURFACE_SOFT).show(ui, |ui| {
-            if self.annotated_strip_indices.is_empty() {
-                ui.label(
-                    RichText::new("暂无已保存标签的图片，保存 .txt 后会在这里出现。")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
+            ui.label(
+                RichText::new(&cur_disp_name)
+                    .small()
+                    .monospace()
+                    .color(theme::ACCENT),
+            )
+            .on_hover_text(if cur_hover_path.is_empty() {
+                "当前无图片".to_string()
             } else {
-                let strip_idxs = self.annotated_strip_indices.clone();
-                let root = self.image_root.clone();
-                egui::ScrollArea::vertical()
-                    .id_salt("annotated_strip_scroll")
-                    .max_height(200.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for strip_idx in strip_idxs {
-                            let Some(path) = self.image_paths.get(strip_idx).cloned() else {
-                                continue;
-                            };
-                            let is_cur = strip_idx == self.current_index;
-                            let rel = path_relative_to(&path, &root)
-                                .to_string_lossy()
-                                .to_string();
-                            let full_path = path.display().to_string();
-                            let fill = if is_cur {
-                                color_alpha(theme::ACCENT, 32)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            Frame::default()
-                                .fill(fill)
-                                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                                .rounding(egui::Rounding::same(10.0))
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if is_cur {
-                                        color_alpha(theme::ACCENT, 110)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    },
-                                ))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.add_sized(
-                                            Vec2::new(20.0, ui.spacing().interact_size.y),
-                                            Label::new(if is_cur {
-                                                RichText::new("✓").strong().color(theme::OK)
-                                            } else {
-                                                RichText::new("·").color(theme::TEXT_MUTED)
-                                            }),
-                                        );
-                                        let sel = ui.selectable_label(
-                                            is_cur,
-                                            RichText::new(&rel)
-                                                .small()
-                                                .monospace()
-                                                .color(if is_cur { theme::TEXT } else { theme::TEXT_MUTED }),
-                                        );
-                                        if sel.clicked() {
-                                            self.go_to_image_index(strip_idx);
-                                        }
-                                        sel.on_hover_text(&full_path);
-                                    });
-                                });
-                            ui.add_space(4.0);
-                        }
-                    });
-            }
+                cur_hover_path.clone()
+            });
         });
+        ui.add_space(3.0);
+        Frame::default()
+            .fill(color_alpha(theme::SURFACE_ELEVATED, 255))
+            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+            .rounding(egui::Rounding::same(8.0))
+            .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .show(ui, |ui| {
+                if self.annotated_strip_indices.is_empty() {
+                    self.annotated_strip_step_scroll_pending = false;
+                    ui.label(
+                        RichText::new("保存有框标签或负样本空 .txt 后出现于此")
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
+                } else {
+                    let strip_idxs = self.annotated_strip_indices.clone();
+                    let summaries = self.annotated_strip_summaries.clone();
+                    let neg_flags = self.annotated_strip_is_neg.clone();
+                    let root = self.image_root.clone();
+                    let row_h = 15.0_f32;
+                    let font = egui::FontId::monospace(11.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("annotated_strip_top_scroll")
+                        .max_height(list_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for (row_i, strip_idx) in strip_idxs.iter().copied().enumerate() {
+                                let Some(path) = self.image_paths.get(strip_idx).cloned() else {
+                                    continue;
+                                };
+                                let is_neg_row = neg_flags.get(row_i).copied().unwrap_or(false);
+                                let (n_cls, n_box) = summaries
+                                    .get(row_i)
+                                    .copied()
+                                    .unwrap_or((0, 0));
+                                let is_cur = strip_idx == self.current_index;
+                                let rel = path_relative_to(&path, &root)
+                                    .to_string_lossy()
+                                    .to_string();
+                                let full_path = path.display().to_string();
+                                let fill = if is_cur {
+                                    color_alpha(theme::ACCENT, 40)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                Frame::default()
+                                    .fill(fill)
+                                    .inner_margin(egui::Margin::symmetric(4.0, 0.0))
+                                    .rounding(egui::Rounding::same(5.0))
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if is_cur {
+                                            color_alpha(theme::ACCENT, 120)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        },
+                                    ))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 3.0;
+                                            ui.add_sized(
+                                                Vec2::new(12.0, row_h),
+                                                Label::new(if is_cur {
+                                                    RichText::new("✓")
+                                                        .strong()
+                                                        .color(theme::OK)
+                                                        .font(font.clone())
+                                                } else {
+                                                    RichText::new("·")
+                                                        .color(theme::TEXT_MUTED)
+                                                        .font(font.clone())
+                                                }),
+                                            );
+                                            let path_resp = ui.selectable_label(
+                                                is_cur,
+                                                RichText::new(&rel)
+                                                    .font(font.clone())
+                                                    .color(if is_cur {
+                                                        theme::TEXT
+                                                    } else {
+                                                        theme::TEXT_MUTED
+                                                    }),
+                                            );
+                                            let (sum_s, sum_tip) = if is_neg_row {
+                                                (
+                                                    "负样本".to_string(),
+                                                    format!("{full_path}\n空 .txt，无目标"),
+                                                )
+                                            } else {
+                                                (
+                                                    format!("{n_cls}类{n_box}框"),
+                                                    format!("{full_path}\n{n_cls} 个不同类别，{n_box} 个框"),
+                                                )
+                                            };
+                                            let sum_resp = ui.label(
+                                                RichText::new(sum_s)
+                                                    .font(font.clone())
+                                                    .color(if is_neg_row {
+                                                        theme::ACCENT
+                                                    } else {
+                                                        theme::WARN
+                                                    }),
+                                            );
+                                            let row_resp = path_resp.union(sum_resp).on_hover_text(sum_tip);
+                                            if row_resp.clicked() {
+                                                self.go_to_image_index(strip_idx);
+                                            }
+                                            if is_cur
+                                                && self.annotated_strip_step_scroll_pending
+                                            {
+                                                // 仅上/下一张步进时滚入视区，避免每帧 scroll 导致手滚条无法停留
+                                                row_resp.scroll_to_me(Some(Align::Center));
+                                                self.annotated_strip_step_scroll_pending = false;
+                                            }
+                                        });
+                                    });
+                            }
+                            if self.annotated_strip_step_scroll_pending {
+                                // 步进后当前图不在本列表中（如正在看未标图）则无需也不应滚
+                                self.annotated_strip_step_scroll_pending = false;
+                            }
+                        });
+                }
+            });
     }
 
     fn ui_sidebar(&mut self, ui: &mut Ui) {
         ui.vertical(|ui| {
             self.sidebar_width = ui.available_width();
             let footer_h = 236.0_f32;
-            // 「图像导航」在侧栏顶部时占位高于原标题行
-            let header_h = 148.0_f32;
+            let header_h = 0.0_f32;
             let ah = ui.available_height();
             let scroll_h = if ah.is_finite() && ah > footer_h + header_h + 80.0 {
                 ah - footer_h - header_h
@@ -3434,94 +5764,6 @@ impl YoloTrainerApp {
                 332.0_f32
             };
             let mut open_section = self.sidebar_open_section;
-
-            let total_images = self.image_paths.len();
-            let current_idx = if total_images == 0 {
-                0
-            } else {
-                self.current_index + 1
-            };
-            let (cur_disp_name, cur_hover_path) = self
-                .image_paths
-                .get(self.current_index)
-                .map(|p| {
-                    let name = p
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.to_string_lossy().into_owned());
-                    (name, p.display().to_string())
-                })
-                .unwrap_or_else(|| ("（未加载）".to_string(), String::new()));
-
-            app_card(theme::SURFACE_ELEVATED).show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("图像导航")
-                                .small()
-                                .strong()
-                                .color(theme::TEXT),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if self.training {
-                                status_chip(ui, "训练中", theme::WARN);
-                            } else {
-                                status_chip(ui, "待机", theme::OK);
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(self.current_index > 0, egui::Button::new("上一张"))
-                            .clicked()
-                        {
-                            self.go_prev_image();
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.image_paths.is_empty()
-                                    && self.current_index + 1 < self.image_paths.len(),
-                                egui::Button::new("下一张"),
-                            )
-                            .clicked()
-                        {
-                            self.go_next_image();
-                        }
-                        if ui
-                            .button("刷新列表")
-                            .on_hover_text("重新扫描目录，并刷新左侧已标注列表")
-                            .clicked()
-                        {
-                            self.refresh_image_list();
-                        }
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(&cur_disp_name)
-                                .small()
-                                .monospace()
-                                .color(theme::TEXT),
-                        )
-                        .on_hover_text(if cur_hover_path.is_empty() {
-                            "当前无图片".to_string()
-                        } else {
-                            cur_hover_path.clone()
-                        });
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        status_chip(ui, &format!("进度 {current_idx}/{total_images}"), theme::ACCENT);
-                        status_chip(ui, &format!("本图 {} 框", self.annotations.len()), theme::OK);
-                        status_chip(
-                            ui,
-                            &format!("已标注 {}", self.annotated_strip_indices.len()),
-                            theme::WARN,
-                        );
-                        status_chip(ui, &format!("类别 {}", self.classes.len()), theme::ACCENT);
-                    });
-                });
-            });
-            ui.add_space(10.0);
 
             egui::ScrollArea::vertical()
                 .id_salt("yolo_left_sidebar_scroll")
@@ -3533,113 +5775,8 @@ impl YoloTrainerApp {
                         1,
                         &mut open_section,
                         "01",
-                        "数据集",
-                        "先选工作目录，再浏览图片与已标注结果。",
-                        Color32::from_rgb(24, 34, 44),
-                        theme::ACCENT,
-                        |ui| {
-                            ui.label(
-                                RichText::new("载入所选目录内一层图片；若该层无图但存在 data.yaml，则按其中 train/val 子目录加载一层图片。标签支持同目录 .txt 或 YOLO 的 images↔labels 目录。")
-                                    .small()
-                                    .color(theme::TEXT_MUTED),
-                            );
-                            ui.add_space(8.0);
-                            if ui
-                                .add_sized(
-                                    Vec2::new(ui.available_width(), 40.0),
-                                    egui::Button::new(
-                                        RichText::new("选择图片目录…")
-                                            .strong()
-                                            .color(theme::TEXT),
-                                    )
-                                    .fill(Color32::from_rgb(68, 118, 88))
-                                    .stroke(Stroke::new(
-                                        1.0,
-                                        Color32::from_rgb(108, 178, 132),
-                                    )),
-                                )
-                                .clicked()
-                            {
-                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                    self.switch_image_root(p);
-                                }
-                            }
-
-                            ui.add_space(10.0);
-                            ui.columns(3, |columns| {
-                                metric_card(
-                                    &mut columns[0],
-                                    "图片",
-                                    self.image_paths.len().to_string(),
-                                    "当前工作集",
-                                    theme::ACCENT,
-                                );
-                                metric_card(
-                                    &mut columns[1],
-                                    "已标注",
-                                    self.annotated_strip_indices.len().to_string(),
-                                    "可快速跳转",
-                                    theme::OK,
-                                );
-                                metric_card(
-                                    &mut columns[2],
-                                    "类别",
-                                    self.classes.len().to_string(),
-                                    "class_log 同步",
-                                    theme::WARN,
-                                );
-                            });
-
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new("当前根目录")
-                                    .small()
-                                    .strong()
-                                    .color(theme::TEXT),
-                            );
-                            ui.add_space(4.0);
-                            {
-                                let root_s = self.image_root.to_string_lossy().to_string();
-                                let pw = ui.available_width();
-                                let row_h = ui.fonts(|f| f.row_height(&egui::FontId::monospace(11.0))) + 10.0;
-                                app_card(theme::SURFACE_SOFT).show(ui, |ui| {
-                                    ui.set_width(pw);
-                                    egui::ScrollArea::horizontal()
-                                        .id_salt("sidebar_image_root_path")
-                                        .max_height(row_h)
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(root_s)
-                                                    .monospace()
-                                                    .size(11.0)
-                                                    .color(theme::TEXT_MUTED),
-                                            );
-                                        });
-                                });
-                            }
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "类别顺序保存在根目录「{}」中，切换目录后会自动读取并同步。",
-                                    CLASS_LOG_FILENAME
-                                ))
-                                .small()
-                                .color(theme::TEXT_MUTED),
-                            );
-                            ui.add_space(12.0);
-                            self.ui_annotated_strip(ui);
-                        },
-                    );
-
-                    ui.add_space(12.0);
-
-                    let _ = section_accordion(
-                        ui,
-                        2,
-                        &mut open_section,
-                        "02",
                         "类别管理",
-                        "在这里维护默认类别、排序、颜色和清理操作。",
+                        "在这里维护类别、排序、颜色和清理操作。",
                         Color32::from_rgb(30, 38, 32),
                         theme::WARN,
                         |ui| {
@@ -3652,38 +5789,21 @@ impl YoloTrainerApp {
 
                             if self.classes.is_empty() {
                                 app_card(theme::SURFACE_SOFT).show(ui, |ui| {
+                                    let cl_path = self.class_log_path();
+                                    let cl_name = cl_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(CLASS_LOG_FILENAME);
                                     ui.label(
                                         RichText::new(format!(
                                             "暂无类别。可以在新建标注框时命名，或直接编辑根目录「{}」新增非注释行。",
-                                            CLASS_LOG_FILENAME
+                                            cl_name
                                         ))
                                         .small()
                                         .color(theme::TEXT_MUTED),
                                     );
                                 });
                             } else {
-                                let active_name = self
-                                    .classes
-                                    .get(self.active_class_idx.min(self.classes.len().saturating_sub(1)))
-                                    .cloned()
-                                    .unwrap_or_else(|| "未选择".to_string());
-                                app_card(theme::SURFACE_SOFT).show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new("默认类别")
-                                                .small()
-                                                .strong()
-                                                .color(theme::TEXT),
-                                        );
-                                        ui.label(
-                                            RichText::new(active_name)
-                                                .small()
-                                                .color(theme::ACCENT),
-                                        );
-                                    });
-                                });
-                                ui.add_space(8.0);
-
                                 while self.class_colors.len() < self.classes.len() {
                                     let k = self.class_colors.len();
                                     self.class_colors.push(palette_color(k));
@@ -3692,16 +5812,18 @@ impl YoloTrainerApp {
                                 let release_lbl = self.show_label_window;
 
                                 app_card(theme::SURFACE_SOFT).show(ui, |ui| {
-                                    let row_h = ui.spacing().interact_size.y + 18.0;
-                                    let row_gap = 4.0_f32;
+                                    let interact_h = ui.spacing().interact_size.y;
+                                    // 每行外框：inner_margin 上下各 6 + 一行控件（色块/输入/按钮 ≈ interact_h），原先 +18 偏小，视口只能容纳约一行。
+                                    let row_slot_h = interact_h + 30.0;
+                                    let row_gap = 6.0_f32;
                                     let visible_rows = 3.0_f32;
+                                    let scroll_viewport_h = row_slot_h * visible_rows
+                                        + row_gap * (visible_rows - 1.0)
+                                        + 8.0;
+                                    ui.set_min_height(scroll_viewport_h);
                                     egui::ScrollArea::vertical()
                                         .id_salt("class_editor_scroll")
-                                        .max_height(
-                                            row_h * visible_rows
-                                                + row_gap * (visible_rows - 1.0)
-                                                + 6.0,
-                                        )
+                                        .max_height(scroll_viewport_h)
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
                                             let mut row = 0usize;
@@ -3804,14 +5926,220 @@ impl YoloTrainerApp {
 
                     let _ = section_accordion(
                         ui,
-                        3,
+                        2,
                         &mut open_section,
-                        "03",
+                        "02",
                         "训练配置",
                         "选择运行环境和基础权重，训练时会自动生成 train_* 包。",
                         Color32::from_rgb(42, 30, 36),
                         theme::DANGER,
                         |ui| {
+                            ui.label(
+                                RichText::new("训练方式")
+                                    .small()
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                            ui.add_space(6.0);
+                            let mode_w = ui.available_width().max(1.0);
+                            let mode_gap = 8.0_f32;
+                            let card_w = ((mode_w - mode_gap) * 0.5).max(96.0);
+                            let card_h = 54.0_f32;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = mode_gap;
+                                let builtin_id = ui.id().with("training_backend_builtin");
+                                let conda_id = ui.id().with("training_backend_conda");
+                                let (builtin_rect, builtin_resp) =
+                                    ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
+                                let (conda_rect, conda_resp) =
+                                    ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
+                                training_backend_card(
+                                    ui,
+                                    builtin_rect,
+                                    &builtin_resp,
+                                    builtin_id,
+                                    "自带 CPU",
+                                    "内置训练器 + 自动转 ONNX",
+                                    theme::OK,
+                                    self.use_builtin_cpu_train,
+                                );
+                                training_backend_card(
+                                    ui,
+                                    conda_rect,
+                                    &conda_resp,
+                                    conda_id,
+                                    "Conda 环境",
+                                    "填写环境根目录并调用 python.exe",
+                                    theme::ACCENT,
+                                    !self.use_builtin_cpu_train,
+                                );
+                                if builtin_resp.clicked() {
+                                    self.use_builtin_cpu_train = true;
+                                }
+                                if conda_resp.clicked() {
+                                    self.use_builtin_cpu_train = false;
+                                }
+                            });
+
+                            ui.add_space(10.0);
+                            if self.use_builtin_cpu_train {
+                                let train_ready = find_builtin_cpu_train_exe().is_some();
+                                let export_ready = find_builtin_onnx_export_exe().is_some();
+                                app_card(theme::SURFACE_SOFT).show(ui, |ui| {
+                                    // 与「训练方式 / 预训练权重」等侧栏定宽区贴合：仅内容时 Frame 会缩窄，需占满可用列宽
+                                    let full_w = ui.available_width().max(1.0);
+                                    ui.set_min_width(full_w);
+                                    ui.label(
+                                        RichText::new("内置组件状态")
+                                            .small()
+                                            .strong()
+                                            .color(theme::TEXT),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        status_chip(
+                                            ui,
+                                            if train_ready {
+                                                "CPU 训练器已就绪"
+                                            } else {
+                                                "CPU 训练器缺失"
+                                            },
+                                            if train_ready { theme::OK } else { theme::DANGER },
+                                        );
+                                        status_chip(
+                                            ui,
+                                            if export_ready {
+                                                "ONNX 转码器已就绪"
+                                            } else {
+                                                "ONNX 转码器缺失"
+                                            },
+                                            if export_ready { theme::OK } else { theme::DANGER },
+                                        );
+                                    });
+                                });
+                            } else {
+                                app_card(theme::SURFACE_SOFT).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("Conda 环境根目录")
+                                                .small()
+                                                .strong()
+                                                .color(theme::TEXT),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.small_button("刷新列表").clicked() {
+                                                    self.refresh_conda_env_list();
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+                                    if self.conda_env_paths.is_empty() {
+                                        ui.label(
+                                            RichText::new(
+                                                "未检测到 Conda，下面可直接填写环境根目录；目录内需要有 python.exe。",
+                                            )
+                                            .small()
+                                            .color(theme::TEXT_MUTED),
+                                        );
+                                    } else {
+                                        self.conda_env_idx = self
+                                            .conda_env_idx
+                                            .min(self.conda_env_paths.len().saturating_sub(1));
+                                        let before_idx = self.conda_env_idx;
+                                        let n = self.conda_env_paths.len();
+                                        ComboBox::from_id_salt("conda_env_pick")
+                                            .width(ui.available_width())
+                                            .selected_text(self.conda_env_paths[self.conda_env_idx].as_str())
+                                            .show_index(ui, &mut self.conda_env_idx, n, |i| {
+                                                self.conda_env_paths[i].as_str()
+                                            });
+                                        if self.conda_env_idx != before_idx
+                                            || self.conda_env_custom_root.trim().is_empty()
+                                        {
+                                            if let Some(path) = self.conda_env_paths.get(self.conda_env_idx) {
+                                                self.conda_env_custom_root = path.clone();
+                                            }
+                                        }
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new("也可以直接填写路径")
+                                                .small()
+                                                .color(theme::TEXT_MUTED),
+                                        );
+                                    }
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.conda_env_custom_root)
+                                            .desired_width(ui.available_width())
+                                            .hint_text(default_conda_env_path()),
+                                    );
+                                    ui.add_space(6.0);
+                                    let resolved_root = self.resolved_conda_root();
+                                    let py = conda_python_executable(Path::new(&resolved_root));
+                                    ui.horizontal_wrapped(|ui| {
+                                        status_chip(
+                                            ui,
+                                            if py.is_file() {
+                                                "python.exe 已找到"
+                                            } else {
+                                                "等待有效环境路径"
+                                            },
+                                            if py.is_file() { theme::OK } else { theme::WARN },
+                                        );
+                                        if !self.conda_env_paths.is_empty() {
+                                            status_chip(
+                                                ui,
+                                                &format!("检测到 {} 个环境", self.conda_env_paths.len()),
+                                                theme::ACCENT,
+                                            );
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "当前将使用：{}",
+                                            if resolved_root.trim().is_empty() {
+                                                "未设置".to_string()
+                                            } else {
+                                                resolved_root
+                                            }
+                                        ))
+                                        .small()
+                                        .color(theme::TEXT_MUTED),
+                                    );
+                                });
+                            }
+
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("预训练权重")
+                                    .small()
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                            ui.add_space(6.0);
+                            app_card(theme::SURFACE_SOFT).show(ui, |ui| {
+                                ui.radio_value(
+                                    &mut self.model_preset,
+                                    ModelPreset::Yolo11n,
+                                    "YOLO11n（更轻，更快启动）",
+                                );
+                                ui.radio_value(
+                                    &mut self.model_preset,
+                                    ModelPreset::Yolo11s,
+                                    "YOLO11s（更强一些，训练更重）",
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("查找顺序：程序目录 -> exe 同目录 -> 图片根目录。若本地没有，则只下载到本次训练包文件夹。")
+                                        .small()
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            });
+
+                            if false {
                             app_card(theme::SURFACE_SOFT).show(ui, |ui| {
                                 ui.checkbox(
                                     &mut self.use_builtin_cpu_train,
@@ -3932,10 +6260,13 @@ impl YoloTrainerApp {
                                 .color(theme::TEXT_MUTED),
                             );
                             ui.label(
-                                RichText::new("开始训练按钮支持滚轮调节 epochs；按住 Shift 可更快增减。")
-                                    .small()
-                                    .color(theme::TEXT_MUTED),
+                                RichText::new(
+                                    "epochs：输入框中直接输入，或托住数字横向拖动；在「开始训练」按钮上滚轮为每次 ±10。",
+                                )
+                                .small()
+                                .color(theme::TEXT_MUTED),
                             );
+                            }
                         },
                     );
                 });
@@ -3961,15 +6292,26 @@ impl YoloTrainerApp {
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("epochs").small().strong().color(theme::TEXT));
-                    ui.add(
-                        egui::DragValue::new(&mut self.train_epochs)
-                            .range(1..=100_000)
-                            .speed(1.0),
+                    ui.label(
+                        RichText::new("epochs")
+                            .size(15.0)
+                            .strong()
+                            .color(theme::TEXT),
                     );
-                    ui.label(RichText::new("Shift + 滚轮可快调").small().color(theme::TEXT_MUTED));
+                    {
+                        use std::ops::Deref;
+                        let mut s = ui.style().deref().clone();
+                        s.override_font_id = Some(egui::FontId::proportional(16.0));
+                        ui.set_style(s);
+                        ui.add(
+                            egui::DragValue::new(&mut self.train_epochs)
+                                .range(1..=100_000)
+                                .speed(1.0),
+                        );
+                        ui.reset_style();
+                    }
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 if self.training {
                     let stop = egui::Button::new(RichText::new("停止训练").strong().size(15.0))
@@ -3999,17 +6341,13 @@ impl YoloTrainerApp {
                         if sy.abs() > f32::EPSILON {
                             self.train_epoch_scroll_accum += sy;
                             const NOTCH: f32 = 120.0;
-                            let step = if ui.input(|i| i.modifiers.shift) {
-                                50u32
-                            } else {
-                                10u32
-                            };
+                            const STEP: u32 = 10;
                             while self.train_epoch_scroll_accum >= NOTCH {
-                                self.train_epochs = self.train_epochs.saturating_add(step).min(100_000);
+                                self.train_epochs = self.train_epochs.saturating_add(STEP).min(100_000);
                                 self.train_epoch_scroll_accum -= NOTCH;
                             }
                             while self.train_epoch_scroll_accum <= -NOTCH {
-                                self.train_epochs = (self.train_epochs.saturating_sub(step)).max(1);
+                                self.train_epochs = (self.train_epochs.saturating_sub(STEP)).max(1);
                                 self.train_epoch_scroll_accum += NOTCH;
                             }
                         }
@@ -4045,73 +6383,75 @@ impl YoloTrainerApp {
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
-                    // 第一行：模型与状态
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new("辅助标注")
-                                .small()
-                                .strong()
-                                .color(theme::TEXT_MUTED),
-                        );
-                        ui.separator();
+                    // 第一行：模型与状态；未载入 ONNX 时「查看完整快捷键」靠右与载入按钮同一行
+                    ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("辅助标注")
+                                    .small()
+                                    .strong()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.separator();
 
-                        if ui
-                            .button("载入 ONNX…")
-                            .on_hover_text(
-                                "选择 Ultralytics 导出的 .onnx（推荐 nms=False, batch=1；也兼容 nms=True）；类别显示为 unknown_0…，推理后按出现的 id 展开筛选",
-                            )
-                            .clicked()
-                        {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("ONNX", &["onnx"])
-                                .pick_file()
-                            {
-                                let onnx_abs = path_abs_for_ospawn(&p);
-                                match onnx_assist::load_session(&onnx_abs) {
-                                    Ok(session) => {
-                                        self.assist_onnx_path = Some(p.clone());
-                                        self.assist_ort = Some(Arc::new(Mutex::new(session)));
-                                        self.assist_class_names.clear();
-                                        self.assist_pred_class_on.clear();
-                                        self.assist_overlay_visible = true;
-                                        self.train_log.push(format!(
-                                            "[辅助] 已载入 ONNX {}（类别名 unknown_0…，首次推理后按 id 展开）",
-                                            p.display()
-                                        ));
-                                        self.schedule_assist_infer();
-                                        ctx.request_repaint();
-                                    }
-                                    Err(e) => self.train_log.push(format!("[辅助] {e}")),
-                                }
-                            }
-                        }
-
-                        if self.assist_ort.is_some() {
                             if ui
-                                .small_button("移除模型")
-                                .on_hover_text("卸载 ONNX、清空预测与进行中的任务")
+                                .button("载入 ONNX…")
+                                .on_hover_text(
+                                    "选择 Ultralytics 导出的 .onnx（推荐 nms=False, batch=1；也兼容 nms=True）；类别显示为 unknown_0…，推理后按出现的 id 展开筛选",
+                                )
                                 .clicked()
                             {
-                                self.assist_onnx_path = None;
-                                self.assist_ort = None;
-                                self.assist_class_names.clear();
-                                self.assist_pred_class_on.clear();
-                                self.assist_preds.clear();
-                                let _ = self.assist_rx.take();
-                                self.assist_busy = false;
-                                let _ = self.assist_batch_rx.take();
-                                self.assist_batch_busy = false;
-                                self.assist_overlay_visible = true;
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("ONNX", &["onnx"])
+                                    .pick_file()
+                                {
+                                    let onnx_abs = path_abs_for_ospawn(&p);
+                                    match onnx_assist::load_session(&onnx_abs) {
+                                        Ok(session) => {
+                                            self.assist_onnx_path = Some(p.clone());
+                                            self.assist_ort = Some(Arc::new(Mutex::new(session)));
+                                            self.assist_class_names.clear();
+                                            self.assist_pred_class_on.clear();
+                                            self.assist_overlay_visible = true;
+                                            self.train_log.push(format!(
+                                                "[辅助] 已载入 ONNX {}（类别名 unknown_0…，首次推理后按 id 展开）",
+                                                p.display()
+                                            ));
+                                            self.schedule_assist_infer();
+                                            ctx.request_repaint();
+                                        }
+                                        Err(e) => self.train_log.push(format!("[辅助] {e}")),
+                                    }
+                                }
                             }
-                        }
 
-                        if let Some(ref p) = self.assist_onnx_path {
-                            let short = p
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("?");
-                            ui.label(RichText::new(short).small().weak());
-                        }
+                            if self.assist_ort.is_some() {
+                                if ui
+                                    .small_button("移除模型")
+                                    .on_hover_text("卸载 ONNX、清空预测与进行中的任务")
+                                    .clicked()
+                                {
+                                    self.assist_onnx_path = None;
+                                    self.assist_ort = None;
+                                    self.assist_class_names.clear();
+                                    self.assist_pred_class_on.clear();
+                                    self.assist_preds.clear();
+                                    let _ = self.assist_rx.take();
+                                    self.assist_busy = false;
+                                    let _ = self.assist_batch_rx.take();
+                                    self.assist_batch_busy = false;
+                                    self.assist_overlay_visible = true;
+                                }
+                            }
+
+                            if let Some(ref p) = self.assist_onnx_path {
+                                let short = p
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("?");
+                                ui.label(RichText::new(short).small().weak());
+                            }
+                        });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if assist_batch {
@@ -4121,162 +6461,268 @@ impl YoloTrainerApp {
                                 ui.spinner();
                                 ui.label(RichText::new("辅助推理中…").small().weak());
                             }
+                            if self.assist_ort.is_none() {
+                                canvas_shortcuts_help_popup(ui);
+                            }
                         });
                     });
 
-                    // 第二行：阈值、显示、类别、采纳（仅已载入模型时）
+                    // 第二行：仅载入 ONNX 后显示：后处理与采纳 + 同排右侧「查看完整快捷键」
                     if self.assist_ort.is_some() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.add_enabled_ui(!assist_row2_blocked, |ui| {
-                                ui.label(RichText::new("阈值").small().weak());
-                                let conf_slider = ui.add_sized(
-                                    [160.0, ui.spacing().interact_size.y],
-                                    egui::Slider::new(&mut self.assist_onnx_conf, 0.0..=1.0)
-                                        .fixed_decimals(2)
-                                        .text("置信度"),
-                                );
-                                if conf_slider.changed() {
-                                    self.assist_onnx_conf =
-                                        self.assist_onnx_conf.clamp(0.0, 1.0);
-                                    self.schedule_assist_infer();
-                                }
-                            });
-
-                            ui.separator();
-
-                            ui.add_enabled_ui(!assist_batch, |ui| {
-                                let mut vis = self.assist_overlay_visible;
-                                let r = ui
-                                    .checkbox(&mut vis, "显示虚线预测")
-                                    .on_hover_text(
-                                        "是否在画布上绘制辅助框；关闭后仍可推理与采纳",
-                                    );
-                                if r.changed() {
-                                    self.assist_overlay_visible = vis;
-                                }
-                            });
-
-                            ui.separator();
-
-                            if !self.assist_class_names.is_empty() {
-                                self.ensure_assist_pred_class_mask();
-                                let n = self.assist_class_names.len();
-                                let n_on = self
-                                    .assist_pred_class_on
-                                    .iter()
-                                    .filter(|&&x| x)
-                                    .count();
-                                let menu_label = if n_on == n {
-                                    format!("类别筛选 · 全部 ({n})")
-                                } else if n_on == 0 {
-                                    "类别筛选 · 未选 ▾".to_string()
-                                } else {
-                                    format!("类别筛选 · {n_on}/{n} ▾")
-                                };
-                                ui.add_enabled_ui(!assist_batch, |ui| {
-                                    ui.menu_button(RichText::new(menu_label).small(), |ui| {
-                                        ui.label(
-                                            RichText::new(
-                                                "勾选参与预览与采纳的类别；未勾选则忽略该类预测",
-                                            )
-                                            .weak()
-                                            .small(),
-                                        );
+                    let assist_pct = (ASSIST_ADOPT_DUP_IOU * 100.0).round() as i32;
+                    let row_h = ui.spacing().interact_size.y;
+                    Frame::default()
+                            .fill(theme::SURFACE_SOFT)
+                            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                            .rounding(egui::Rounding::same(8.0))
+                            .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("assist_onnx_toolbar_h")
+                                    .auto_shrink([true, true])
+                                    .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            if ui.small_button("全选").clicked() {
-                                                for v in &mut self.assist_pred_class_on {
-                                                    *v = true;
-                                                }
-                                            }
-                                            if ui.small_button("全不选").clicked() {
-                                                for v in &mut self.assist_pred_class_on {
-                                                    *v = false;
-                                                }
-                                            }
-                                        });
-                                        ui.separator();
-                                        egui::ScrollArea::vertical()
-                                            .max_height(220.0)
-                                            .id_salt("assist_pred_class_scroll")
-                                            .show(ui, |ui| {
-                                                for i in 0..self.assist_class_names.len() {
-                                                    let name = self.assist_class_names[i].as_str();
-                                                    let mut on = self.assist_pred_class_on[i];
-                                                    if ui.checkbox(&mut on, name).changed() {
-                                                        self.assist_pred_class_on[i] = on;
-                                                    }
+                                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+
+                                            // 置信度 / IoU：同一列宽标签（右对齐）+ 等宽滑块，两行严格对齐。
+                                            const SLIDER_LABEL_W: f32 = 58.0;
+                                            const SLIDER_TRACK_W: f32 = 90.0;
+                                            ui.add_enabled_ui(!assist_row2_blocked, |ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.spacing_mut().item_spacing.y = 5.0;
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                                        ui.allocate_ui_with_layout(
+                                                            Vec2::new(SLIDER_LABEL_W, row_h),
+                                                            egui::Layout::right_to_left(egui::Align::Center),
+                                                            |ui| {
+                                                                ui.label(
+                                                                    RichText::new("置信度")
+                                                                        .small()
+                                                                        .color(theme::TEXT_MUTED),
+                                                                );
+                                                            },
+                                                        );
+                                                        let r = ui
+                                                            .add_sized(
+                                                                [SLIDER_TRACK_W, row_h],
+                                                                egui::Slider::new(
+                                                                    &mut self.assist_onnx_conf,
+                                                                    0.0..=1.0,
+                                                                )
+                                                                .fixed_decimals(2),
+                                                            )
+                                                            .on_hover_text(
+                                                                "低于此置信度的检测会被丢弃，随后再按 IoU 做 NMS。",
+                                                            );
+                                                        if r.changed() {
+                                                            self.assist_onnx_conf = self
+                                                                .assist_onnx_conf
+                                                                .clamp(0.0, 1.0);
+                                                            self.schedule_assist_infer();
+                                                        }
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                                        ui.allocate_ui_with_layout(
+                                                            Vec2::new(SLIDER_LABEL_W, row_h),
+                                                            egui::Layout::right_to_left(egui::Align::Center),
+                                                            |ui| {
+                                                                ui.label(
+                                                                    RichText::new("IoU")
+                                                                        .small()
+                                                                        .color(theme::TEXT_MUTED),
+                                                                );
+                                                            },
+                                                        );
+                                                        let r = ui
+                                                            .add_sized(
+                                                                [SLIDER_TRACK_W, row_h],
+                                                                egui::Slider::new(
+                                                                    &mut self.assist_onnx_iou,
+                                                                    0.0..=1.0,
+                                                                )
+                                                                .fixed_decimals(2),
+                                                            )
+                                                            .on_hover_text(
+                                                                "同类框 IoU 大于该值时去掉较低分框；nms=True/False 导出均会再应用一轮。\n调高 → 要更高重叠才去重；调低 → 去重更积极。",
+                                                            );
+                                                        if r.changed() {
+                                                            self.assist_onnx_iou = self
+                                                                .assist_onnx_iou
+                                                                .clamp(0.0, 1.0);
+                                                            self.schedule_assist_infer();
+                                                        }
+                                                    });
+                                                });
+                                            });
+
+                                            ui.separator();
+
+                                            ui.add_enabled_ui(!assist_batch, |ui| {
+                                                let mut vis = self.assist_overlay_visible;
+                                                let r = ui
+                                                    .checkbox(&mut vis, "虚线")
+                                                    .on_hover_text(
+                                                        "显示虚线预测框；关闭后仍可推理与采纳",
+                                                    );
+                                                if r.changed() {
+                                                    self.assist_overlay_visible = vis;
                                                 }
                                             });
+
+                                            if !self.assist_class_names.is_empty() {
+                                                ui.separator();
+                                                self.ensure_assist_pred_class_mask();
+                                                let n = self.assist_class_names.len();
+                                                let n_on = self
+                                                    .assist_pred_class_on
+                                                    .iter()
+                                                    .filter(|&&x| x)
+                                                    .count();
+                                                let menu_label = if n_on == n {
+                                                    format!("类 {n} ▾")
+                                                } else if n_on == 0 {
+                                                    "类 · 关 ▾".to_string()
+                                                } else {
+                                                    format!("类 {n_on}/{n} ▾")
+                                                };
+                                                ui.add_enabled_ui(!assist_batch, |ui| {
+                                                    ui.menu_button(
+                                                        RichText::new(menu_label)
+                                                            .small()
+                                                            .color(theme::ACCENT),
+                                                        |ui| {
+                                                            ui.label(
+                                                                RichText::new(
+                                                                    "勾选参与预览与采纳的类别",
+                                                                )
+                                                                .weak()
+                                                                .small(),
+                                                            );
+                                                            ui.horizontal(|ui| {
+                                                                if ui.small_button("全选").clicked()
+                                                                {
+                                                                    for v in &mut self
+                                                                        .assist_pred_class_on
+                                                                    {
+                                                                        *v = true;
+                                                                    }
+                                                                }
+                                                                if ui.small_button("全不选").clicked()
+                                                                {
+                                                                    for v in &mut self
+                                                                        .assist_pred_class_on
+                                                                    {
+                                                                        *v = false;
+                                                                    }
+                                                                }
+                                                            });
+                                                            ui.separator();
+                                                            egui::ScrollArea::vertical()
+                                                                .max_height(220.0)
+                                                                .id_salt(
+                                                                    "assist_pred_class_scroll",
+                                                                )
+                                                                .show(ui, |ui| {
+                                                                    for i in 0..self
+                                                                        .assist_class_names
+                                                                        .len()
+                                                                    {
+                                                                        let name = self
+                                                                            .assist_class_names
+                                                                            [i]
+                                                                            .as_str();
+                                                                        let mut on =
+                                                                            self.assist_pred_class_on
+                                                                                [i];
+                                                                        if ui
+                                                                            .checkbox(&mut on, name)
+                                                                            .changed()
+                                                                        {
+                                                                            self.assist_pred_class_on
+                                                                                [i] = on;
+                                                                        }
+                                                                    }
+                                                                });
+                                                        },
+                                                    );
+                                                });
+                                            }
+
+                                            ui.separator();
+
+                                            ui.add_enabled_ui(
+                                                !assist_row2_blocked
+                                                    && self.rgba.is_some()
+                                                    && !self.assist_preds.is_empty(),
+                                                |ui| {
+                                                    let b = egui::Button::new(
+                                                        RichText::new("采纳当前")
+                                                            .small()
+                                                            .strong(),
+                                                    )
+                                                    .fill(color_alpha(theme::ACCENT_DIM, 200))
+                                                    .stroke(Stroke::new(
+                                                        1.0,
+                                                        color_alpha(theme::ACCENT, 140),
+                                                    ))
+                                                    .min_size(Vec2::new(68.0, row_h));
+                                                    if ui
+                                                        .add(b)
+                                                        .on_hover_text(format!(
+                                                            "将虚线框写入当前图 .txt；与已有框 IoU≥{assist_pct}% 则不新增"
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        self.adopt_onnx_assist_to_annotations();
+                                                        ctx.request_repaint();
+                                                    }
+                                                },
+                                            );
+
+                                            ui.add_enabled_ui(
+                                                !assist_row2_blocked
+                                                    && !self.image_paths.is_empty(),
+                                                |ui| {
+                                                    let b = egui::Button::new(
+                                                        RichText::new("全局采纳")
+                                                            .small()
+                                                            .strong(),
+                                                    )
+                                                    .fill(color_alpha(theme::WARN, 55))
+                                                    .stroke(Stroke::new(
+                                                        1.0,
+                                                        color_alpha(theme::WARN, 160),
+                                                    ))
+                                                    .min_size(Vec2::new(72.0, row_h));
+                                                    if ui
+                                                        .add(b)
+                                                        .on_hover_text(format!(
+                                                            "对数据集每张图推理并写入；规则同采纳当前；Ctrl+Z 可整集撤销（IoU≥{assist_pct}% 保留原框）"
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        self.schedule_assist_global_adopt();
+                                                        ctx.request_repaint();
+                                                    }
+                                                },
+                                            );
+
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    canvas_shortcuts_help_popup(ui);
+                                                    ui.separator();
+                                                },
+                                            );
+                                        });
                                     });
-                                });
-                            }
-
-                            ui.separator();
-
-                            let pct = (ASSIST_ADOPT_DUP_IOU * 100.0).round() as i32;
-                            ui.add_enabled_ui(
-                                !assist_row2_blocked
-                                    && self.rgba.is_some()
-                                    && !self.assist_preds.is_empty(),
-                                |ui| {
-                                    if ui
-                                        .small_button("采纳当前图")
-                                        .on_hover_text(format!(
-                                            "将虚线框写入当前图 .txt；与已有框 IoU≥{pct}% 则不新增"
-                                        ))
-                                        .clicked()
-                                    {
-                                        self.adopt_onnx_assist_to_annotations();
-                                        ctx.request_repaint();
-                                    }
-                                },
-                            );
-
-                            ui.add_enabled_ui(
-                                !assist_row2_blocked && !self.image_paths.is_empty(),
-                                |ui| {
-                                    if ui
-                                        .small_button("全局采纳")
-                                        .on_hover_text(format!(
-                                            "对左侧数据集每张图推理并写入标签；规则同「采纳当前图」；可用 Ctrl+Z 整集撤销（IoU≥{pct}% 保留原框）"
-                                        ))
-                                        .clicked()
-                                    {
-                                        self.schedule_assist_global_adopt();
-                                        ctx.request_repaint();
-                                    }
-                                },
-                            );
-                        });
+                            });
                     }
                 });
             });
-        ui.add_space(4.0);
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("标注画布")
-                    .strong()
-                    .size(18.0)
-                    .color(theme::TEXT),
-            );
-            status_chip(ui, "R 矩形", theme::ACCENT);
-            status_chip(ui, "E 柔性外接", theme::WARN);
-            status_chip(ui, "F 连续柔性", theme::WARN);
-            status_chip(ui, "Ctrl+滚轮 缩放", theme::ACCENT);
-            status_chip(ui, "空格+拖动 平移", theme::OK);
-            CollapsingHeader::new(RichText::new("查看完整快捷键").small().color(theme::TEXT_MUTED))
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "R：矩形两点框 · E：柔性外接（整笔一框）· F：连续柔性外接（自相交成环；多边形套圈只保留外圈；两检测框 AABB 有面积重叠则删小留大、不合并；绿色笔画与预览；结束一笔后统一命名）· 点击开始 → 移动画线 → 再点击结束 · 右键退出当前模式 · Ctrl+滚轮缩放 · 空格+左键平移 · Del/Q 删除 · Esc 取消 · Ctrl+Z 撤销 · A/D 切图",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                });
-        });
         ui.add_space(4.0);
 
         let Some(rgba) = &self.rgba else {
@@ -4297,7 +6743,7 @@ impl YoloTrainerApp {
                                     .color(theme::TEXT_MUTED),
                             );
                             ui.label(
-                                RichText::new("在左侧「数据集」中选择图片目录，将列出该目录内的图片与同名标签（不含子文件夹）。")
+                                RichText::new("在顶部进度/统计信息下方点击「选择图片目录…」，将列出该目录内的图片与同名标签（不含子文件夹）。")
                                     .small()
                                     .weak(),
                             );
@@ -4347,6 +6793,52 @@ impl YoloTrainerApp {
 
         let sense = Sense::click_and_drag().union(Sense::hover());
         let response = ui.allocate_rect(inner, sense);
+        let _ = response.context_menu(|ui| {
+            let can = !self.image_paths.is_empty()
+                && self.annotations.is_empty()
+                && !self.show_label_window
+                && self.scribble_kind.is_none()
+                && !self.scribble_active
+                && self.pending_box.is_none()
+                && self.pending_boxes_batch.is_empty();
+            if !can {
+                return;
+            }
+            let Some(p) = self.image_paths.get(self.current_index) else {
+                return;
+            };
+            if path_has_nonempty_label_file(p) {
+                ui.label(
+                    RichText::new("当前图已有非空标签行，请清空标签后再设负样本")
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
+                return;
+            }
+            if path_is_negative_label_only(p) {
+                ui.label(
+                    RichText::new("已是负样本（与图同名的空 .txt 已存在）")
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
+                return;
+            }
+            if ui
+                .button("将此图以负样本加入训练")
+                .on_hover_text("写入与图同名的**空** .txt；将出现在已标注列表，视频进度为蓝点。")
+                .clicked()
+            {
+                match self.mark_current_image_as_negative_sample() {
+                    Ok(()) => {
+                        self.train_log
+                            .push("已写入空 .txt 作为负样本，并刷新已标/进度。".to_string());
+                    }
+                    Err(e) => self
+                        .train_log
+                        .push(format!("[负样本] 写入失败: {e}")),
+                }
+            }
+        });
 
         let space_down = ctx.input(|i| i.key_down(egui::Key::Space));
 
@@ -4469,7 +6961,37 @@ impl YoloTrainerApp {
         }
 
         let dt = ctx.input(|i| i.stable_dt as f32).min(0.05);
+        if self.carousel_ring_active() && self.drag.is_some() {
+            let _ = self.save_current_labels();
+            self.drag = None;
+        }
+        self.carousel_ring_step(
+            ctx,
+            &response,
+            inner,
+            dt,
+            pointer,
+            primary_pressed,
+            primary_released,
+            dragging,
+            space_down,
+        );
+        self.carousel_ring_try_pick(ctx, inner, pointer);
         let hover_canvas = response.hovered();
+        let hover_img_pos = if hover_canvas {
+            pointer.map(|p| map_screen_to_image_px(p, disp, img_wf, img_hf))
+        } else {
+            None
+        };
+        // 与按 W/S 时相比指针在**屏幕**上移动超过约 3 点则放弃同点双击改层（缩放不改变屏幕位置，不破坏锁定）
+        const STACK_DBLCLK_MAX_MOVE_PX2: f32 = 3.0 * 3.0;
+        if let Some((at_screen, _tidx, lock_frame)) = self.stack_nav_dblclk_lock.as_ref() {
+            let should_clear = *lock_frame != self.current_index
+                || pointer.map_or(true, |cur| (cur - *at_screen).length_sq() > STACK_DBLCLK_MAX_MOVE_PX2);
+            if should_clear {
+                self.stack_nav_dblclk_lock = None;
+            }
+        }
         let prim_down = ctx.input(|i| i.pointer.primary_down());
         let drag_edge = self.drag.and_then(|(k, _)| match k {
             DragKind::ResizeEdge(e) => Some(e),
@@ -4595,23 +7117,69 @@ impl YoloTrainerApp {
             // 否则侧栏等处点击也会触发 primary_pressed，会误当成第二点并弹出「输入标签」。
             let (ix, iy) = map_screen_to_image_px(p, disp, img_wf, img_hf);
 
+            let mut skip_primary_pending_reopen = false;
+            if !self.show_label_window
+                && (self.pending_box.is_some() || !self.pending_boxes_batch.is_empty())
+                && primary_pressed
+                && !block_bbox
+                && !space_down
+                && self.scribble_kind.is_none()
+                && response.hovered()
+            {
+                if let Some((pix, piy)) = screen_to_image(p, disp, img_wf, img_hf) {
+                    let hit_pb =
+                        |pb: &PendingBox| pix >= pb.min_x && pix <= pb.max_x && piy >= pb.min_y && piy <= pb.max_y;
+                    let hit = self.pending_box.as_ref().is_some_and(hit_pb)
+                        || self.pending_boxes_batch.iter().any(hit_pb);
+                    if hit {
+                        self.show_label_window = true;
+                        self.label_edit_idx = None;
+                        self.label_draft = self.active_class_label_draft();
+                        skip_primary_pending_reopen = true;
+                    }
+                }
+            }
+
             let mut skip_primary_after_dbl = false;
             if ctx.input(|i| i.pointer.button_double_clicked(PointerButton::Primary))
                 && !block_bbox
+                && !skip_primary_pending_reopen
                 && !self.draw_new_boxes_enabled
                 && self.scribble_kind.is_none()
                 && !space_down
                 && response.hovered()
             {
                 if let Some((ix, iy)) = screen_to_image(p, disp, img_wf, img_hf) {
-                    if let Some(idx) = self
-                        .annotations
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(_, b)| Self::hit_inside((ix, iy), b))
-                        .map(|(i, _)| i)
-                    {
+                    const STACK_DBLCLK_MAX_MOVE_PX2: f32 = 3.0 * 3.0;
+                    let idx = {
+                        let from_stack_lock = if let Some((sp, tidx, at_i)) =
+                            self.stack_nav_dblclk_lock
+                        {
+                            if at_i == self.current_index
+                                && tidx < self.annotations.len()
+                                && Self::hit_inside((ix, iy), &self.annotations[tidx])
+                                && (p - sp).length_sq() <= STACK_DBLCLK_MAX_MOVE_PX2
+                            {
+                                Some(tidx)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(i) = from_stack_lock {
+                            Some(i)
+                        } else {
+                            self.annotations
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .find(|(_, b)| Self::hit_inside((ix, iy), b))
+                                .map(|(i, _)| i)
+                        }
+                    };
+                    if let Some(idx) = idx {
+                        self.stack_nav_dblclk_lock = None;
                         self.drag = None;
                         self.draw_phase = DrawPhase::Idle;
                         self.selected = Some(idx);
@@ -4628,7 +7196,7 @@ impl YoloTrainerApp {
                 }
             }
 
-            if self.scribble_kind.is_some() && !block_bbox && !space_down {
+            if self.scribble_kind.is_some() && !block_bbox && !space_down && !skip_primary_pending_reopen {
                 let (ix, iy) = map_screen_to_image_px(p, disp, img_wf, img_hf);
                 let ix = ix.clamp(0.0, img_wf);
                 let iy = iy.clamp(0.0, img_hf);
@@ -4677,7 +7245,12 @@ impl YoloTrainerApp {
                 }
             }
 
-            if primary_pressed && !block_bbox && !skip_primary_after_dbl && self.scribble_kind.is_none()
+            if primary_pressed
+                && !block_bbox
+                && !skip_primary_after_dbl
+                && !skip_primary_pending_reopen
+                && self.scribble_kind.is_none()
+                && !self.carousel_ring_active()
             {
                 if let Some((ix, iy)) = screen_to_image(p, disp, img_wf, img_hf) {
                     if self.draw_new_boxes_enabled {
@@ -4742,13 +7315,14 @@ impl YoloTrainerApp {
                         if self.drag.is_none() {
                             match &self.draw_phase {
                                 DrawPhase::Idle => {
-                                    for (idx, b) in self.annotations.iter().enumerate() {
-                                        if Self::hit_inside((ix, iy), b) {
-                                            self.push_undo(UndoScope::Local);
-                                            self.selected = Some(idx);
-                                            self.drag = Some((DragKind::Move, idx));
-                                            break;
-                                        }
+                                    if let Some(idx) = self
+                                        .overlap_stack_indices_at((ix, iy))
+                                        .into_iter()
+                                        .next()
+                                    {
+                                        self.push_undo(UndoScope::Local);
+                                        self.selected = Some(idx);
+                                        self.drag = Some((DragKind::Move, idx));
                                     }
                                 }
                                 DrawPhase::AwaitingSecondClick { .. } => {
@@ -4826,12 +7400,13 @@ impl YoloTrainerApp {
             }
         }
 
+        let label_te_focused_here = ctx.memory(|m| m.has_focus(label_draft_textedit_id()));
         let typing_elsewhere = ctx.wants_keyboard_input();
         ctx.input(|i| {
             let q_remove = i.key_pressed(egui::Key::Q)
                 && !self.show_label_window
                 && !typing_elsewhere;
-            if i.key_pressed(egui::Key::Delete) || q_remove {
+            if i.key_pressed(egui::Key::Delete) {
                 if let Some(si) = self.selected {
                     if si < self.annotations.len() {
                         self.push_undo(UndoScope::Local);
@@ -4839,6 +7414,56 @@ impl YoloTrainerApp {
                         self.selected = None;
                         let _ = self.save_current_labels();
                     }
+                }
+            } else if q_remove {
+                if self.suppress_bbox_q_delete_once {
+                    self.suppress_bbox_q_delete_once = false;
+                } else if let Some(si) = self.selected {
+                    if si < self.annotations.len() {
+                        self.push_undo(UndoScope::Local);
+                        self.annotations.remove(si);
+                        self.selected = None;
+                        let _ = self.save_current_labels();
+                    }
+                }
+            }
+            let allow_ad = !self.show_label_window
+                && !label_te_focused_here
+                && (!typing_elsewhere || hover_canvas);
+            if allow_ad {
+                if self.drag.is_none() {
+                    if let Some(p_img) = hover_img_pos {
+                        if i.key_pressed(egui::Key::W) {
+                            if self.cycle_overlap_selection_at(p_img, true) {
+                                if let (Some(screen_p), Some(si)) = (pointer, self.selected) {
+                                    self.stack_nav_dblclk_lock =
+                                        Some((screen_p, si, self.current_index));
+                                }
+                            }
+                        }
+                        if i.key_pressed(egui::Key::S) {
+                            if self.cycle_overlap_selection_at(p_img, false) {
+                                if let (Some(screen_p), Some(si)) = (pointer, self.selected) {
+                                    self.stack_nav_dblclk_lock =
+                                        Some((screen_p, si, self.current_index));
+                                }
+                            }
+                        }
+                    }
+                }
+                if i.key_pressed(egui::Key::A) {
+                    if self.current_index > 0 {
+                        self.image_nav_btn_fx[0] = 1.0;
+                    }
+                    self.go_prev_image();
+                }
+                if i.key_pressed(egui::Key::D) {
+                    if !self.image_paths.is_empty()
+                        && self.current_index + 1 < self.image_paths.len()
+                    {
+                        self.image_nav_btn_fx[1] = 1.0;
+                    }
+                    self.go_next_image();
                 }
             }
         });
@@ -4913,6 +7538,27 @@ impl YoloTrainerApp {
             painter.add(egui::Shape::galley(tp, galley, cc));
         }
 
+        const PENDING_LBL_DASH: f32 = 5.0;
+        const PENDING_LBL_GAP: f32 = 4.0;
+        let pending_lbl_stroke =
+            Stroke::new(2.0, Color32::from_rgba_unmultiplied(90, 210, 130, 220));
+        for pb in self.pending_box.iter().chain(self.pending_boxes_batch.iter()) {
+            let c_tl = image_to_screen(pb.min_x, pb.min_y, disp, img_wf, img_hf);
+            let c_br = image_to_screen(pb.max_x, pb.max_y, disp, img_wf, img_hf);
+            let r = Rect::from_two_pos(c_tl, c_br);
+            let mn = r.min;
+            let mx = r.max;
+            let top = [Pos2::new(mn.x, mn.y), Pos2::new(mx.x, mn.y)];
+            let right = [Pos2::new(mx.x, mn.y), Pos2::new(mx.x, mx.y)];
+            let bottom = [Pos2::new(mx.x, mx.y), Pos2::new(mn.x, mx.y)];
+            let left = [Pos2::new(mn.x, mx.y), Pos2::new(mn.x, mn.y)];
+            for seg in [&top[..], &right[..], &bottom[..], &left[..]] {
+                for s in Shape::dashed_line(seg, pending_lbl_stroke, PENDING_LBL_DASH, PENDING_LBL_GAP) {
+                    painter.add(s);
+                }
+            }
+        }
+
         const ASSIST_DASH: f32 = 5.0;
         const ASSIST_GAP: f32 = 4.0;
         if self.assist_overlay_visible {
@@ -4976,8 +7622,8 @@ impl YoloTrainerApp {
         const SCRIBBLE_LINE_W: f32 = 2.2;
         let (scribble_col, scribble_col_soft) = match self.scribble_kind {
             Some(ScribbleKind::ContinuousCircumscribed) => (
-                Color32::from_rgb(60, 255, 120),
-                Color32::from_rgba_unmultiplied(60, 255, 120, 210),
+                theme::ACCENT,
+                color_alpha(theme::ACCENT, 210),
             ),
             _ => (
                 Color32::from_rgb(255, 72, 72),
@@ -5033,18 +7679,18 @@ impl YoloTrainerApp {
             );
         }
 
-        // 柔性外接：红色十字；连续柔性外接：绿色十字；矩形拉框：淡绿色十字
+        // 柔性外接：红色十字；连续柔性外接：蓝色十字；矩形拉框：淡绿色十字
         if response.hovered() && self.scribble_kind.is_some() {
             let p = pointer.or_else(|| ctx.input(|i| i.pointer.hover_pos()));
             if let Some(p) = p {
                 if disp.contains(p) {
                     let dash_col = match self.scribble_kind {
                         Some(ScribbleKind::ContinuousCircumscribed) => {
-                            Color32::from_rgba_unmultiplied(60, 255, 120, 200)
+                            color_alpha(theme::ACCENT, 200)
                         }
                         _ => Color32::from_rgba_unmultiplied(255, 72, 72, 200),
                     };
-                    let stroke = Stroke::new(1.0, dash_col);
+                    let stroke = Stroke::new(CROSSHAIR_STROKE, dash_col);
                     let h_seg = [Pos2::new(inner.left(), p.y), Pos2::new(inner.right(), p.y)];
                     let v_seg = [Pos2::new(p.x, inner.top()), Pos2::new(p.x, inner.bottom())];
                     for s in Shape::dashed_line(&h_seg, stroke, CROSSHAIR_DASH, CROSSHAIR_GAP) {
@@ -5060,7 +7706,7 @@ impl YoloTrainerApp {
             if let Some(p) = p {
                 if disp.contains(p) {
                     let stroke = Stroke::new(
-                        1.0,
+                        CROSSHAIR_STROKE,
                         Color32::from_rgba_unmultiplied(60, 255, 120, 77),
                     );
                     let h_seg = [Pos2::new(inner.left(), p.y), Pos2::new(inner.right(), p.y)];
@@ -5075,7 +7721,7 @@ impl YoloTrainerApp {
             }
         }
 
-        let mode_str: String = match self.scribble_kind {
+        let mut mode_str: String = match self.scribble_kind {
             Some(ScribbleKind::Circumscribed) => "柔性外接".to_string(),
             Some(ScribbleKind::ContinuousCircumscribed) => {
                 let n = self.scribble_closed_boxes.len();
@@ -5088,6 +7734,15 @@ impl YoloTrainerApp {
             None if self.draw_new_boxes_enabled => "拉新框".to_string(),
             None => "调整框".to_string(),
         };
+        if self.carousel_ring_active() {
+            mode_str.push_str(" · 环轨相册");
+            painter.rect_filled(
+                inner,
+                6.0,
+                Color32::from_rgba_unmultiplied(8, 10, 18, 140),
+            );
+            self.paint_carousel_ring(ctx, &painter, inner);
+        }
         let hud = format!("缩放 {:.0}% · {}", self.view_zoom * 100.0, mode_str);
         let hud_font = egui::FontId::proportional(13.0);
         let hud_color = Color32::from_rgb(232, 238, 248);
@@ -5100,10 +7755,65 @@ impl YoloTrainerApp {
             Color32::from_rgba_unmultiplied(18, 20, 28, 210),
         );
         painter.galley(text_rect.min, galley_hud, hud_color);
+
+        if self.carousel_ring_active() {
+            let bar_h = 34.0_f32;
+            let bar = Rect::from_min_max(
+                Pos2::new(inner.left() + 8.0, inner.bottom() - bar_h - 6.0),
+                Pos2::new(inner.right() - 8.0, inner.bottom() - 6.0),
+            );
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bar), |ui| {
+                Frame::default()
+                    .fill(Color32::from_rgba_unmultiplied(14, 16, 24, 210))
+                    .rounding(egui::Rounding::same(8.0))
+                    .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            ui.label(
+                                RichText::new("环轨分组")
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.separator();
+                            let n_a = self.annotated_strip_indices.len();
+                            let n_u = self.unannotated_strip_indices.len();
+                            let a_sel = self.carousel_ring_pool == CarouselRingPool::Annotated;
+                            let u_sel = self.carousel_ring_pool == CarouselRingPool::Unannotated;
+                            if ui
+                                .selectable_label(
+                                    a_sel,
+                                    RichText::new(format!("已标注 · {n_a}"))
+                                        .small()
+                                        .strong(),
+                                )
+                                .on_hover_text("仅浏览已有非空标签的图片")
+                                .clicked()
+                            {
+                                self.set_carousel_ring_pool(CarouselRingPool::Annotated);
+                            }
+                            if ui
+                                .selectable_label(
+                                    u_sel,
+                                    RichText::new(format!("未标注 · {n_u}"))
+                                        .small()
+                                        .strong(),
+                                )
+                                .on_hover_text("浏览尚无有效标注行的图片")
+                                .clicked()
+                            {
+                                self.set_carousel_ring_pool(CarouselRingPool::Unannotated);
+                            }
+                        });
+                    });
+            });
+        }
     }
 
     fn ui_top_bar(&mut self, ui: &mut Ui) {
-        let top_h = 96.0;
+        // 含导航行 + 统计芯片 +「选择图片目录」按钮
+        let top_h = 140.0;
         let gap = 10.0;
         let total_w = ui.available_width();
         // 全图总览卡片最大宽度（靠右对齐；右缘与下方标注画布右缘对齐，画布矩形来自上一帧）
@@ -5128,11 +7838,16 @@ impl YoloTrainerApp {
                 let slot = (overview_right - min_overview_left).max(1.0);
                 let overview_w = slot.min(overview_panel_max_w);
                 let overview_left = overview_right - overview_w;
+                let middle_w = (slot - overview_w - gap).max(0.0);
+                let middle_rect = Rect::from_min_size(
+                    Pos2::new(min_overview_left, left_rect.top()),
+                    Vec2::new(middle_w, top_h),
+                );
                 let right_rect = Rect::from_min_size(
                     Pos2::new(overview_left, left_rect.top()),
                     Vec2::new(overview_w, top_h),
                 );
-                let union_rect = Rect::from_min_max(left_rect.min, right_rect.max);
+                let union_rect = left_rect.union(middle_rect).union(right_rect);
                 ui.allocate_rect(union_rect, Sense::hover());
 
                 let mut left_ui = ui.new_child(
@@ -5144,29 +7859,137 @@ impl YoloTrainerApp {
                     .inner_margin(egui::Margin::same(14.0))
                     .show(&mut left_ui, |ui| {
                         ui.set_min_height(top_h - 16.0);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("YOLO水平框专属标注工具")
-                                        .strong()
-                                        .size(19.0)
-                                        .color(theme::TEXT),
-                                );
-                                ui.label(
-                                    RichText::new("致力于快速拿到预模型和终模型")
-                                        .size(15.0)
-                                        .color(theme::TEXT_MUTED),
-                                );
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if self.training {
-                                    status_chip(ui, "训练中", theme::WARN);
-                                } else {
-                                    status_chip(ui, "待命", theme::OK);
+                        const NAME_PX: f32 = 31.0;
+                        const LOGO_INSET: f32 = 3.0;
+                        let name_yolo = self.brand_name_font(NAME_PX);
+                        let name_vet = self.brand_name_font(NAME_PX);
+                        ui.with_layout(
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
+                                if let Some(tex) = &self.top_bar_logo {
+                                    // 左上展示行内，为 YoloVet+分隔+状态芯片保留宽度，徽标为内接**最大**正方形
+                                    const RESERVE_NAME_CHIP: f32 = 255.0;
+                                    const HAIR_GUT: f32 = 16.0;
+                                    const ROW_PAD: f32 = 8.0;
+                                    let row = ui.max_rect();
+                                    let h_lim = (row.height() * 0.95).max(1.0);
+                                    let w_lim = (row.width() - RESERVE_NAME_CHIP - HAIR_GUT - ROW_PAD)
+                                        .max(1.0);
+                                    // 在「可用行高 × 为 logo 预留的横向带」的矩形中内接的最大正方形
+                                    let side = h_lim.min(w_lim);
+                                    // 过窄/过矮时仍保下限；过大时限制在单栏内观感
+                                    let side = side.clamp(24.0, 96.0);
+                                    let logo_outer = side + LOGO_INSET * 2.0;
+                                    let corner = (side * 0.26).clamp(6.0, 12.0);
+                                    Frame::none()
+                                        .fill(theme::SURFACE_DEEP)
+                                        .inner_margin(egui::Margin::same(LOGO_INSET))
+                                        .rounding(egui::Rounding::same(corner))
+                                        .stroke(Stroke::new(
+                                            1.0,
+                                            color_alpha(theme::ACCENT, 64),
+                                        ))
+                                        .show(ui, |ui| {
+                                            let (r, _resp) = ui.allocate_exact_size(
+                                                Vec2::splat(side),
+                                                Sense::hover(),
+                                            );
+                                            ui.painter().image(
+                                                tex.id(),
+                                                r,
+                                                Rect::from_min_max(
+                                                    Pos2::ZERO,
+                                                    Pos2::new(1.0, 1.0),
+                                                ),
+                                                Color32::WHITE,
+                                            );
+                                        });
+                                    let h_cell = logo_outer;
+                                    let (sep_cell, _resp) = ui.allocate_exact_size(
+                                        Vec2::new(16.0, h_cell),
+                                        Sense::hover(),
+                                    );
+                                    let x = sep_cell.left() + 3.0;
+                                    let y0 = sep_cell.top() + 3.0;
+                                    let y1 = sep_cell.bottom() - 3.0;
+                                    ui.painter().line_segment(
+                                        [Pos2::new(x, y0), Pos2::new(x, y1)],
+                                        Stroke::new(1.0, color_alpha(theme::BORDER, 100)),
+                                    );
                                 }
-                            });
-                        });
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
+                                    // YoloVet（Times New Roman）+ 与徽标呼应的 Yolo / Vet 分色
+                                    ui.label(
+                                        RichText::new("Yolo")
+                                            .font(name_yolo)
+                                            .color(theme::TEXT),
+                                    );
+                                    ui.add_space(1.0);
+                                    ui.label(
+                                        RichText::new("Vet")
+                                            .font(name_vet)
+                                            .color(color_alpha(theme::ACCENT, 250)),
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if self.training {
+                                            status_chip(ui, "训练中", theme::WARN);
+                                        } else {
+                                            status_chip(ui, "待命", theme::OK);
+                                        }
+                                    },
+                                );
+                            },
+                        );
                     });
+
+                if middle_w > 48.0 {
+                    let mut middle_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(middle_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    middle_ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
+                        let sep_w = 10.0_f32;
+                        let strip_w = (middle_w * 0.48)
+                            .clamp(120.0, 280.0)
+                            .min((middle_w - sep_w - 100.0).max(100.0));
+                        let nav_w = (middle_w - strip_w - sep_w).max(72.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(strip_w, top_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                self.ui_annotated_strip_top_bar(ui, top_h);
+                            },
+                        );
+                        ui.separator();
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(nav_w, top_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                self.ui_top_bar_image_nav(ui);
+                            },
+                        );
+                    });
+                } else if middle_rect.width() > 1.0 {
+                    // 中部极窄时仍保留选目录入口（按钮已从侧栏移出）
+                    let mut middle_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(middle_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    middle_ui.vertical(|ui| {
+                        let compact_pick_w = ui.available_width().max(1.0);
+                        self.ui_source_picker_pair(ui, compact_pick_w, 28.0);
+                    });
+                }
 
                 let right_ui = ui.new_child(
                     egui::UiBuilder::new()
@@ -5216,33 +8039,55 @@ impl YoloTrainerApp {
 
     fn ui_train_log_panel(&mut self, ui: &mut Ui) {
         ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                let toggle_text = if self.train_log_expanded {
-                    "收起训练日志"
-                } else {
-                    "展开训练日志"
-                };
-                if ui
-                    .button(toggle_text)
-                    .on_hover_text("点击切换训练日志面板的展开与折叠")
-                    .clicked()
-                {
-                    self.train_log_expanded = !self.train_log_expanded;
-                }
+            let header_h = ui.spacing().interact_size.y.max(28.0);
+            let header_rect =
+                Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), header_h));
+            ui.allocate_rect(header_rect, Sense::hover());
 
-                ui.label(RichText::new("训练日志").strong().size(15.0).color(theme::TEXT));
-                ui.label(
-                    RichText::new(format!("{} 行", self.train_log.len()))
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
+            let left_rect = Rect::from_min_max(
+                header_rect.left_top(),
+                Pos2::new(header_rect.left() + 340.0, header_rect.bottom()),
+            );
+            let mut left_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(left_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            let toggle_text = if self.train_log_expanded {
+                "收起训练日志"
+            } else {
+                "展开训练日志"
+            };
+            if left_ui
+                .button(toggle_text)
+                .on_hover_text("点击切换训练日志面板的展开与折叠")
+                .clicked()
+            {
+                self.train_log_expanded = !self.train_log_expanded;
+            }
+            left_ui.label(RichText::new("训练日志").strong().size(15.0).color(theme::TEXT));
+            left_ui.label(
+                RichText::new(format!("{} 行", self.train_log.len()))
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            );
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.train_log_expanded && ui.small_button("清空日志").clicked() {
-                        self.train_log.clear();
-                    }
-                });
-            });
+            let right_rect = Rect::from_min_max(
+                Pos2::new(header_rect.right() - 120.0, header_rect.top()),
+                header_rect.right_bottom(),
+            );
+            let mut right_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(right_rect)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
+            if self.train_log_expanded && right_ui.small_button("清空日志").clicked() {
+                self.train_log.clear();
+            }
+
+            if self.video_session.is_some() {
+                self.ui_bottom_video_progress(ui, header_rect, left_rect.right(), right_rect.left());
+            }
             if self.train_log_expanded {
                 ui.add_space(8.0);
                 app_card(theme::SURFACE_ELEVATED).show(ui, |ui| {
@@ -5279,6 +8124,312 @@ impl YoloTrainerApp {
                 ui.label(RichText::new(preview).small().color(theme::TEXT_MUTED));
             }
         });
+    }
+
+    fn ui_bottom_video_progress(
+        &mut self,
+        ui: &mut Ui,
+        header_rect: Rect,
+        left_limit: f32,
+        right_limit: f32,
+    ) {
+        let total_images = self.image_paths.len();
+        if total_images == 0 {
+            return;
+        }
+        let canvas_center_x = self
+            .last_canvas_inner
+            .map(|r| r.center().x)
+            .unwrap_or_else(|| header_rect.center().x);
+        let canvas_w = self
+            .last_canvas_inner
+            .map(|r| r.width())
+            .unwrap_or_else(|| header_rect.width());
+        let available_w = (right_limit - left_limit - 24.0).max(0.0);
+        if available_w < 120.0 {
+            return;
+        }
+        let strip_w = (canvas_w * 0.74)
+            .clamp(480.0, 1020.0)
+            .min(available_w);
+        let mut x0 = canvas_center_x - strip_w * 0.5;
+        x0 = x0.clamp(left_limit + 10.0, right_limit - strip_w - 10.0);
+        let strip_rect = Rect::from_center_size(
+            Pos2::new(x0 + strip_w * 0.5, header_rect.center().y),
+            Vec2::new(strip_w + 34.0, 22.0),
+        );
+        let strip_response = ui.interact(
+            strip_rect,
+            ui.id().with("bottom_video_progress"),
+            Sense::click().union(Sense::drag()),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+        let progress_id = ui.id().with("bottom_video_progress_fx");
+        let hover = ui
+            .ctx()
+            .animate_bool_responsive(progress_id.with("hover"), strip_response.hovered());
+        let active = ui.ctx().animate_bool_responsive(
+            progress_id.with("active"),
+            strip_response.is_pointer_button_down_on() || strip_response.dragged(),
+        );
+        if hover > 0.001 || active > 0.001 {
+            ui.ctx().request_repaint();
+        }
+        let painter = ui.painter_at(strip_rect);
+        let primary = Color32::from_rgb(98, 210, 130);
+        let primary_edge = Color32::from_rgb(132, 232, 160);
+        let red = Color32::from_rgb(222, 76, 76);
+        let neg_blue = Color32::from_rgb(96, 168, 255);
+        let neg_blue_stroke = Color32::from_rgb(140, 200, 255);
+        let magnet_amber = Color32::from_rgb(255, 200, 95);
+        let track = strip_rect.shrink2(Vec2::new(9.0, 4.1 - active * 0.6));
+        let outer_track = track.expand2(Vec2::new(6.0 + hover * 2.0, 1.8 + hover * 0.9));
+        painter.rect_filled(
+            outer_track,
+            999.0,
+            color_alpha(primary, (18.0 + hover * 22.0 + active * 28.0) as u8),
+        );
+        painter.rect_filled(track, 999.0, Color32::from_rgb(19, 25, 31));
+        painter.rect_filled(
+            track,
+            999.0,
+            color_alpha(primary_edge, (8.0 + hover * 12.0) as u8),
+        );
+
+        const MAGNET_PX: f32 = 22.0; // 屏内距离：进入此圈即磁吸
+        let bn = self.image_nav_progress_bucket_n;
+        let b_pos = &self.image_nav_progress_bucket_has_box;
+        let b_neg = &self.image_nav_progress_bucket_has_neg;
+        let bar_w = track.width();
+        let bar_left = track.left();
+        let bar_cy = track.center().y;
+        let t_anim = ui.ctx().input(|i| i.time) as f32;
+        let mag_pulse = 0.5 + 0.5 * (t_anim * 6.2).sin();
+        // 悬停且指针靠近某个红点（桶心）时：用于轨迹线、加大绘制与点击/拖动时吸附
+        let magnet: Option<(usize, Pos2, f32)> = (|| {
+            if !strip_response.hovered() || bn == 0 {
+                return None;
+            }
+            let hp = strip_response.hover_pos()?;
+            let r2 = MAGNET_PX * MAGNET_PX;
+            let mut best: Option<(usize, f32, f32)> = None; // (bi, d2, t_snap_01)
+            for bi in 0..b_pos.len() {
+                let is_hit = b_pos.get(bi).copied().unwrap_or(false)
+                    || b_neg.get(bi).copied().unwrap_or(false);
+                if !is_hit {
+                    continue;
+                }
+                let t_snap = (bi as f32 + 0.5) / bn as f32;
+                let x = bar_left + t_snap * bar_w;
+                let p = Pos2::new(x, bar_cy);
+                let d2 = (hp - p).length_sq();
+                if d2 < r2 && best.map_or(true, |b| d2 < b.1) {
+                    best = Some((bi, d2, t_snap));
+                }
+            }
+            best.map(|(bi, d2, t_snap)| {
+                let s = 1.0 - d2.sqrt() / MAGNET_PX;
+                (bi, Pos2::new(bar_left + t_snap * bar_w, bar_cy), s.clamp(0.0, 1.0))
+            })
+        })();
+        if strip_response.hovered() && magnet.as_ref().is_some_and(|m| m.2 > 0.02) {
+            ui.ctx().request_repaint();
+        }
+
+        let play_x =
+            track.left() + (self.current_index as f32 + 0.5) / total_images as f32 * track.width();
+        let play_x = play_x.clamp(track.left() + 2.0, track.right() - 2.0);
+        let done_rect = Rect::from_min_max(
+            track.left_top(),
+            Pos2::new(play_x, track.bottom()),
+        );
+        painter.rect_filled(
+            done_rect,
+            999.0,
+            color_alpha(primary, (122.0 + hover * 26.0 + active * 24.0) as u8),
+        );
+        if bn > 0 {
+            if let (Some(m), Some(hp)) = (&magnet, strip_response.hover_pos()) {
+                if m.2 > 0.12 {
+                    painter.line_segment(
+                        [hp, m.1],
+                        Stroke::new(
+                            1.0 + 0.5 * m.2 * mag_pulse,
+                            color_alpha(
+                                magnet_amber,
+                                (50.0 + 130.0 * m.2 * mag_pulse) as u8,
+                            ),
+                        ),
+                    );
+                }
+            }
+            for bi in 0..b_pos.len() {
+                let pos_hit = b_pos.get(bi).copied().unwrap_or(false);
+                let neg_hit = b_neg.get(bi).copied().unwrap_or(false);
+                if !pos_hit && !neg_hit {
+                    continue;
+                }
+                let t_snap = (bi as f32 + 0.5) / bn as f32;
+                let x = bar_left + t_snap * bar_w;
+                let p = Pos2::new(x, bar_cy);
+                let (dot, stroke_hi) = if pos_hit {
+                    (red, red)
+                } else {
+                    (neg_blue, neg_blue_stroke)
+                };
+                let is_mag = magnet
+                    .as_ref()
+                    .is_some_and(|(mb, _, s)| *mb == bi && *s > 0.12);
+                let s_mag = if is_mag {
+                    magnet
+                        .as_ref()
+                        .filter(|(mb, _, _)| *mb == bi)
+                        .map(|(_, _, s)| *s)
+                } else {
+                    None
+                }
+                .unwrap_or(0.0);
+                if is_mag {
+                    let ph = 0.35 + 0.65 * mag_pulse;
+                    for (k, er) in [(0.0_f32, 9.0), (0.6, 6.0), (1.2, 3.0)] {
+                        let rr = (er * (0.6 + 0.45 * s_mag) + 2.0 * ph) * (1.0 - k * 0.1);
+                        painter.circle_stroke(
+                            p,
+                            rr,
+                            Stroke::new(
+                                0.7,
+                                color_alpha(
+                                    magnet_amber,
+                                    ((22.0 + 55.0 * s_mag) * (1.0 - k * 0.2)) as u8,
+                                ),
+                            ),
+                        );
+                    }
+                }
+                let base_r = if is_mag {
+                    3.0 + 2.0 * mag_pulse * s_mag + hover * 0.35
+                } else {
+                    3.0 + hover * 0.35
+                };
+                painter.circle_filled(p, base_r, color_alpha(dot, 236));
+                if is_mag {
+                    painter.circle_filled(
+                        p,
+                        1.6 * (0.85 + 0.15 * mag_pulse),
+                        color_alpha(Color32::from_rgb(255, 255, 240), 230),
+                    );
+                }
+                let stroke_c = if is_mag {
+                    color_alpha(magnet_amber, (140.0 + 100.0 * mag_pulse) as u8)
+                } else {
+                    color_alpha(stroke_hi, (102.0 + hover * 34.0) as u8)
+                };
+                painter.circle_stroke(
+                    p,
+                    4.6 + hover * 0.9 + if is_mag { 2.0 + 2.0 * mag_pulse * s_mag } else { 0.0 },
+                    Stroke::new(0.9, stroke_c),
+                );
+            }
+        }
+        painter.rect_stroke(
+            track,
+            999.0,
+            Stroke::new(
+                1.05 + hover * 0.35,
+                color_alpha(primary_edge, (132.0 + hover * 72.0 + active * 18.0) as u8),
+            ),
+        );
+        let left_cap = Pos2::new(track.left(), track.center().y);
+        let right_cap = Pos2::new(track.right(), track.center().y);
+        painter.circle_filled(left_cap, track.height() * 0.5, color_alpha(primary, 72));
+        painter.circle_filled(right_cap, track.height() * 0.5, color_alpha(primary, 42));
+        let knob = Pos2::new(play_x, track.center().y);
+        painter.circle_filled(
+            knob,
+            5.6 + hover * 0.8 + active * 1.2,
+            color_alpha(primary_edge, 228),
+        );
+        painter.circle_filled(
+            knob,
+            2.6 + hover * 0.3,
+            color_alpha(Color32::from_rgb(245, 250, 247), 248),
+        );
+        painter.circle_stroke(
+            knob,
+            8.2 + hover * 1.6 + active * 1.2,
+            Stroke::new(1.0 + hover * 0.35, color_alpha(primary, 140)),
+        );
+
+        if strip_response.clicked() || strip_response.dragged() {
+            if let Some(pos) = strip_response.interact_pointer_pos() {
+                let t_raw = ((pos.x - bar_left) / bar_w.max(1.0e-3)).clamp(0.0, 1.0);
+                let t_use = if bn > 0 {
+                    let r2 = MAGNET_PX * MAGNET_PX;
+                    let mut best: Option<(f32, f32)> = None;
+                    for bi in 0..b_pos.len() {
+                        let is_hit = b_pos.get(bi).copied().unwrap_or(false)
+                            || b_neg.get(bi).copied().unwrap_or(false);
+                        if !is_hit {
+                            continue;
+                        }
+                        let t_snap = (bi as f32 + 0.5) / bn as f32;
+                        let dot = Pos2::new(bar_left + t_snap * bar_w, bar_cy);
+                        let d2 = (pos - dot).length_sq();
+                        if d2 < r2 && best.map_or(true, |b| d2 < b.1) {
+                            best = Some((t_snap, d2));
+                        }
+                    }
+                    best.map(|(t, _)| t).unwrap_or(t_raw)
+                } else {
+                    t_raw
+                };
+                let idx = (t_use * total_images as f32).floor() as usize;
+                self.go_to_image_index(idx.min(total_images.saturating_sub(1)));
+            }
+        }
+        strip_response.on_hover_text(format!(
+            "视频进度：点击或拖动跳转，靠近圆点磁吸；绿条=当前；红=有框；蓝=负样本。有框 {} 帧，仅负样本 {} 帧。",
+            self.dataset_n_with_boxes, self.dataset_n_neg_only
+        ));
+    }
+
+    fn ui_video_load_progress_window(&mut self, ctx: &Context) {
+        let progress = self.video_load_progress.clamp(0.0, 1.0);
+        egui::Window::new("载入视频")
+            .collapsible(false)
+            .resizable(false)
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("正在读取完整帧")
+                            .strong()
+                            .size(18.0)
+                            .color(theme::TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(self.video_load_status.as_str())
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(340.0)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("视频较大时需要一些时间，完成后会自动进入逐帧标注。")
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
+            });
     }
 
     fn handle_overview_viewport_interaction(
@@ -5390,6 +8541,7 @@ impl YoloTrainerApp {
 impl eframe::App for YoloTrainerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_training(ctx);
+        self.poll_video_load(ctx);
         self.poll_assist_infer(ctx);
         self.poll_assist_batch(ctx);
         if !self.class_log_bootstrapped {
@@ -5402,15 +8554,20 @@ impl eframe::App for YoloTrainerApp {
             self.conda_env_list_bootstrapped = true;
         }
 
+        // 不得在 `ctx.input` 闭包内再调用 `ctx.memory` / `ctx.input`，否则会死锁（egui 文档）。
+        let label_te_focused = ctx.memory(|m| m.has_focus(label_draft_textedit_id()));
         ctx.input(|i| {
-            if i.key_pressed(egui::Key::Escape) {
-                if self.show_label_window {
-                    self.pending_box = None;
-                    self.pending_boxes_batch.clear();
-                    self.label_edit_idx = None;
-                    self.show_label_window = false;
-                    self.draw_phase = DrawPhase::Idle;
-                } else if self.scribble_active {
+            let esc = i.key_pressed(egui::Key::Escape);
+            let q_label_cancel = self.show_label_window
+                && i.key_pressed(egui::Key::Q)
+                && !label_te_focused;
+            if self.show_label_window && (esc || q_label_cancel) {
+                if q_label_cancel {
+                    self.suppress_bbox_q_delete_once = true;
+                }
+                self.cancel_label_dialog();
+            } else if esc {
+                if self.scribble_active {
                     self.scribble_active = false;
                     self.scribble_points.clear();
                     self.scribble_open_start = 0;
@@ -5488,12 +8645,6 @@ impl eframe::App for YoloTrainerApp {
                     }
                 }
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::A)) {
-                self.go_prev_image();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::D)) {
-                self.go_next_image();
-            }
             if ctx.input(|i| {
                 i.key_pressed(egui::Key::Z) && (i.modifiers.ctrl || i.modifiers.command)
             }) {
@@ -5561,6 +8712,10 @@ impl eframe::App for YoloTrainerApp {
                     });
                 ui.add_space(4.0);
             });
+
+        if self.video_load_busy {
+            self.ui_video_load_progress_window(ctx);
+        }
 
         if self.show_label_window {
             let editing = self.label_edit_idx.is_some();
@@ -5658,15 +8813,22 @@ impl eframe::App for YoloTrainerApp {
                         enter || space
                     };
                     ui.horizontal(|ui| {
-                        if ui.button("确定").clicked() || confirm_keys {
+                        if ui
+                            .button("确定（空格）")
+                            .on_hover_text("输入框聚焦时按回车也可确定")
+                            .clicked()
+                            || confirm_keys
+                        {
                             self.finalize_pending_with_label();
                         }
-                        if ui.button("取消").clicked() {
-                            self.pending_box = None;
-                            self.pending_boxes_batch.clear();
-                            self.label_edit_idx = None;
-                            self.show_label_window = false;
-                            self.draw_phase = DrawPhase::Idle;
+                        if ui
+                            .button("取消（q）")
+                            .on_hover_text(
+                                "新框命名时会直接取消这次新框；修改已有框标签时只会取消本次编辑。按 Esc 效果相同。输入框聚焦时请先点别处再按 Q，以免误输入。",
+                            )
+                            .clicked()
+                        {
+                            self.cancel_label_dialog();
                         }
                     });
                 });
@@ -5681,7 +8843,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 640.0])
-            .with_title("YOLO 标注与训练器"),
+            .with_title("YoloVet"),
         persist_window: false,
         persistence_path: None,
         ..Default::default()
