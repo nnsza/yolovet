@@ -2057,6 +2057,11 @@ fn canvas_shortcuts_help_popup(ui: &mut Ui) {
                             shortcut_explain_line(
                                 ui,
                                 &[],
+                                "在画布上 右键（需：当前图无内存中框、无标签命名窗、无 E/F/涂鸦/矩形选点等）会弹出负样本菜单：无同名非空 .txt 时可点「将此图以负样本加入训练」写入空标签；若已是负样本（仅空/备注 .txt），同菜单位置为 红底白字 的「取消此图片为负样本」，删空 .txt 恢复为未标。有非空标签行时仅提示先清空。",
+                            );
+                            shortcut_explain_line(
+                                ui,
+                                &[],
                                 "左键拖拽：移动框、拉角/边缩放。环轨/视频等界面另有「单击缩略图」「条上拖动」等提示，见主界面。",
                             );
 
@@ -2366,13 +2371,14 @@ fn prepare_training_bundle_in_dir(
     let mut skipped_no_training_labels = 0usize;
 
     for src_img in image_paths {
-        let Ok(img) = image::open(src_img) else {
+        let Ok(_img) = image::open(src_img) else {
             skipped_no_training_labels += 1;
             continue;
         };
-        let (w, h) = img.dimensions();
         let src_lbl = label_txt_path_for_image(src_img);
-        if load_annotations(&src_lbl, w, h).is_empty() {
+        // 有至少一行有效标签内容 → 正样本；仅有空/全注释 .txt → 负样本（无目标图）。无同名 .txt → 未标，不进包。
+        let in_training = path_has_nonempty_label_file(src_img) || path_is_negative_label_only(src_img);
+        if !in_training {
             skipped_no_training_labels += 1;
             continue;
         }
@@ -2395,7 +2401,7 @@ fn prepare_training_bundle_in_dir(
 
     if skipped_no_training_labels > 0 {
         let _ = tx.send(TrainMsg::Line(format!(
-            "[准备] 已跳过 {skipped_no_training_labels} 张未进入训练包的图片（无法打开或无有效标注行）。"
+            "[准备] 已跳过 {skipped_no_training_labels} 张未进入训练包的图片（无法打开、或无同名 .txt/未标）。有框的 .txt 与空 .txt 负样本会进入包。"
         )));
     }
 
@@ -2793,8 +2799,11 @@ impl YoloTrainerApp {
         assist_class_mask_allows(&self.assist_pred_class_on, model_class_id)
     }
 
-    /// 从磁盘重载 `classes`：切换数据根或视频后应调用；无文件时清空（与选图片目录时一致，不会残留上一次的类别）。
+    /// 从磁盘重载 `classes`：切换数据根或视频后应调用；无文件时清空。同时清空 ONNX 辅助类名/预测，不携带**上一数据源的**状态。
     fn load_class_log_from_disk(&mut self) {
+        self.assist_class_names.clear();
+        self.assist_pred_class_on.clear();
+        self.assist_preds.clear();
         self.classes.clear();
         self.class_colors.clear();
         // 读路径：图片模式仅 `class_log.txt`；视频模式先 `class_log_{stem}.txt`，若无则回退到同目录 `class_log.txt`（旧版习惯）
@@ -2939,6 +2948,13 @@ impl YoloTrainerApp {
             if was_video_mode {
                 let _ = self.save_current_labels();
                 self.cancel_assist_tasks();
+                // 从视频切回同目录图集：清空类别，后续 refresh 仅按**当前** `class_log.txt` 重载
+                self.classes.clear();
+                self.class_colors.clear();
+                self.active_class_idx = 0;
+                self.assist_class_names.clear();
+                self.assist_pred_class_on.clear();
+                self.assist_preds.clear();
                 self.reset_canvas_runtime_cache();
                 self.annotated_strip_indices.clear();
                 self.unannotated_strip_indices.clear();
@@ -2950,6 +2966,13 @@ impl YoloTrainerApp {
         }
         let _ = self.save_current_labels();
         self.cancel_assist_tasks();
+        // 新目录：先不携带旧类名/辅助名（refresh 中 load_class_log 会按新目录重载，无则空表）
+        self.classes.clear();
+        self.class_colors.clear();
+        self.active_class_idx = 0;
+        self.assist_class_names.clear();
+        self.assist_pred_class_on.clear();
+        self.assist_preds.clear();
         self.reset_canvas_runtime_cache();
         self.annotated_strip_indices.clear();
         self.unannotated_strip_indices.clear();
@@ -2962,6 +2985,12 @@ impl YoloTrainerApp {
     /// 载入视频：从第 0 帧起可浏览；仅当保存带框标注时写入与视频同目录的 jpg + txt。
     fn load_video_session(&mut self, video_path: PathBuf) {
         self.cancel_assist_tasks();
+        // 新视频：立刻清空「类别管理」在内存中的状态，不沿用上一路径/目录的类名
+        self.classes.clear();
+        self.class_colors.clear();
+        self.active_class_idx = 0;
+        self.assist_class_names.clear();
+        self.assist_pred_class_on.clear();
         if !video_path.is_file() || !is_video_file(&video_path) {
             self.train_log
                 .push("[视频] 请选择一个视频文件（如 mp4、mov、mkv、webm）。".to_string());
@@ -3934,6 +3963,23 @@ impl YoloTrainerApp {
         Ok(())
     }
 
+    /// 若当前图仅为负样本（空/全注释的同名 `.txt`），则删除该文件，恢复为未标。
+    fn unmark_current_image_negative_sample(&mut self) -> std::io::Result<()> {
+        if !self.annotations.is_empty() {
+            return Ok(());
+        }
+        let Some(p) = self.image_paths.get(self.current_index) else {
+            return Ok(());
+        };
+        if !path_is_negative_label_only(p) {
+            return Ok(());
+        }
+        let txt = label_txt_path_for_image(p);
+        fs::remove_file(&txt)?;
+        self.mark_annotated_strip_dirty();
+        Ok(())
+    }
+
     fn save_current_labels(&mut self) -> std::io::Result<()> {
         let Some(img) = &self.rgba else {
             return Ok(());
@@ -3960,6 +4006,22 @@ impl YoloTrainerApp {
                 save_annotations(&lbl, &self.annotations, w, h)?;
             }
         } else {
+            if self.annotations.is_empty() {
+                if !path_label_file_exists(img_path) {
+                    // 从未有标签：不落盘
+                    return Ok(());
+                }
+                if path_is_negative_label_only(img_path) {
+                    // 已手动标为负样本：保留空/备注 .txt，不改为「从有标删成负样本」
+                    return Ok(());
+                }
+                // 磁盘为「有标注行或曾可解析为框」之类（非仅手动的空/备注负样本）；用户已删光内存中框 → 删 .txt 恢复为未标，不写成空文件当负样本
+                if lbl.is_file() {
+                    fs::remove_file(&lbl)?;
+                }
+                self.mark_annotated_strip_dirty();
+                return Ok(());
+            }
             save_annotations(&lbl, &self.annotations, w, h)?;
         }
         self.mark_annotated_strip_dirty();
@@ -6793,52 +6855,89 @@ impl YoloTrainerApp {
 
         let sense = Sense::click_and_drag().union(Sense::hover());
         let response = ui.allocate_rect(inner, sense);
-        let _ = response.context_menu(|ui| {
-            let can = !self.image_paths.is_empty()
-                && self.annotations.is_empty()
-                && !self.show_label_window
-                && self.scribble_kind.is_none()
-                && !self.scribble_active
-                && self.pending_box.is_none()
-                && self.pending_boxes_batch.is_empty();
-            if !can {
-                return;
-            }
-            let Some(p) = self.image_paths.get(self.current_index) else {
-                return;
-            };
-            if path_has_nonempty_label_file(p) {
-                ui.label(
-                    RichText::new("当前图已有非空标签行，请清空标签后再设负样本")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                return;
-            }
-            if path_is_negative_label_only(p) {
-                ui.label(
-                    RichText::new("已是负样本（与图同名的空 .txt 已存在）")
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
-                return;
-            }
-            if ui
-                .button("将此图以负样本加入训练")
-                .on_hover_text("写入与图同名的**空** .txt；将出现在已标注列表，视频进度为蓝点。")
-                .clicked()
-            {
-                match self.mark_current_image_as_negative_sample() {
-                    Ok(()) => {
-                        self.train_log
-                            .push("已写入空 .txt 作为负样本，并刷新已标/进度。".to_string());
+        // 图上有未保存框、或本帧正在其它交互时，**不要**注册 `context_menu`，否则无内容时仍会开空包层，呈现小黑块。
+        // 无框且可交互时，用固定横向宽度，避免 CJK 在过窄里竖排为「一字一列」。
+        let can_neg_interact = !self.image_paths.is_empty()
+            && self
+                .image_paths
+                .get(self.current_index)
+                .is_some()
+            && self.annotations.is_empty()
+            && !self.show_label_window
+            && self.scribble_kind.is_none()
+            && !self.scribble_active
+            && self.pending_box.is_none()
+            && self.pending_boxes_batch.is_empty();
+        if can_neg_interact {
+            let _ = response.context_menu(|ui| {
+                // 仅 `set_min_width`；勿用 `set_max_width(f32::INFINITY)`，会走「宽为 ∞」的布局路径，在部分对齐下产生非法 rect，可能导致渲染 panic（exit 101）。
+                ui.set_min_width(300.0);
+                if let Some(p) = self.image_paths.get(self.current_index) {
+                    if path_has_nonempty_label_file(p) {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(280.0);
+                            ui.label(
+                                RichText::new("当前图已有非空标签行，请清空标签后再设负样本")
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        });
+                    } else if path_is_negative_label_only(p) {
+                        let unneg_btn = ui
+                            .add_sized(
+                                Vec2::new(280.0, ui.spacing().interact_size.y),
+                                egui::Button::new(
+                                    RichText::new("取消此图片为负样本")
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(color_alpha(theme::DANGER, 240))
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    color_alpha(Color32::from_rgb(180, 55, 70), 255),
+                                )),
+                            )
+                            .on_hover_text("删除与图同名的空 .txt；将恢复为未标，并刷新已标/视频进度。");
+                        if unneg_btn.clicked() {
+                            match self.unmark_current_image_negative_sample() {
+                                Ok(()) => {
+                                    self.train_log.push(
+                                        "已删除负样本空 .txt，该图恢复为未标注。".to_string(),
+                                    );
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => self
+                                    .train_log
+                                    .push(format!("[负样本] 取消负样本失败: {e}")),
+                            }
+                        }
+                    } else {
+                        // 必须每帧都 `add` 按钮，不能用 `else if response.clicked()` 当条件，否则首帧不显示
+                        let neg_btn = ui
+                            .add_sized(
+                                Vec2::new(280.0, ui.spacing().interact_size.y),
+                                egui::Button::new(
+                                    RichText::new("将此图以负样本加入训练")
+                                        .strong()
+                                        .color(theme::TEXT),
+                                ),
+                            )
+                            .on_hover_text("写入与图同名的空 .txt；将出现在已标注列表，视频进度为蓝点。");
+                        if neg_btn.clicked() {
+                            match self.mark_current_image_as_negative_sample() {
+                                Ok(()) => {
+                                    self.train_log
+                                        .push("已写入空 .txt 作为负样本，并刷新已标/进度。".to_string());
+                                }
+                                Err(e) => self
+                                    .train_log
+                                    .push(format!("[负样本] 写入失败: {e}")),
+                            }
+                        }
                     }
-                    Err(e) => self
-                        .train_log
-                        .push(format!("[负样本] 写入失败: {e}")),
                 }
-            }
-        });
+            });
+        }
 
         let space_down = ctx.input(|i| i.key_down(egui::Key::Space));
 
