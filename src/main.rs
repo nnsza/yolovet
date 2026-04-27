@@ -2452,6 +2452,8 @@ struct YoloTrainerApp {
     conda_env_idx: usize,
     conda_env_custom_root: String,
     conda_env_list_bootstrapped: bool,
+    /// 首帧先让窗口完成布局/绘制，再从下一帧起跑 `conda env list`，避免卡冷启动白屏。
+    conda_bootstrap_painted_once: bool,
     use_builtin_cpu_train: bool,
     sidebar_open_section: Option<u8>,
     sidebar_width: f32,
@@ -2629,8 +2631,16 @@ impl YoloTrainerApp {
         cc.egui_ctx.set_style(style);
 
         let top_bar_logo = (|| {
-            let p = std::path::Path::new(r"C:\Users\78672\Pictures\lll.png");
-            let img = image::open(p).ok()?;
+            let mut candidates = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    candidates.push(parent.join("lll.png"));
+                    candidates.push(parent.join("resources").join("lll.png"));
+                }
+            }
+            candidates.push(PathBuf::from(r"C:\Users\78672\Pictures\lll.png"));
+            let p = candidates.into_iter().find(|p| p.is_file())?;
+            let img = image::open(&p).ok()?;
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
             if w == 0 || h == 0 {
@@ -2653,6 +2663,7 @@ impl YoloTrainerApp {
             conda_env_idx: 0,
             conda_env_custom_root: default_conda_env_path(),
             conda_env_list_bootstrapped: false,
+            conda_bootstrap_painted_once: false,
             use_builtin_cpu_train: false,
             // 1 = 类别管理，2 = 训练配置（原「数据集」折叠栏已移除）
             sidebar_open_section: Some(1),
@@ -7959,7 +7970,6 @@ impl YoloTrainerApp {
                     .show(&mut left_ui, |ui| {
                         ui.set_min_height(top_h - 16.0);
                         const NAME_PX: f32 = 31.0;
-                        const LOGO_INSET: f32 = 3.0;
                         let name_yolo = self.brand_name_font(NAME_PX);
                         let name_vet = self.brand_name_font(NAME_PX);
                         ui.with_layout(
@@ -7975,16 +7985,13 @@ impl YoloTrainerApp {
                                     let h_lim = (row.height() * 0.95).max(1.0);
                                     let w_lim = (row.width() - RESERVE_NAME_CHIP - HAIR_GUT - ROW_PAD)
                                         .max(1.0);
-                                    // 在「可用行高 × 为 logo 预留的横向带」的矩形中内接的最大正方形
-                                    let side = h_lim.min(w_lim);
-                                    // 过窄/过矮时仍保下限；过大时限制在单栏内观感
-                                    let side = side.clamp(24.0, 96.0);
-                                    let logo_outer = side + LOGO_INSET * 2.0;
-                                    let corner = (side * 0.26).clamp(6.0, 12.0);
+                                    // 取当前可用区域内接的最大正方形；只保最小下限，不再额外压小。
+                                    let side = h_lim.min(w_lim).max(24.0);
+                                    let logo_outer = side;
                                     Frame::none()
                                         .fill(theme::SURFACE_DEEP)
-                                        .inner_margin(egui::Margin::same(LOGO_INSET))
-                                        .rounding(egui::Rounding::same(corner))
+                                        .inner_margin(egui::Margin::same(0.0))
+                                        .rounding(egui::Rounding::same(0.0))
                                         .stroke(Stroke::new(
                                             1.0,
                                             color_alpha(theme::ACCENT, 64),
@@ -7994,13 +8001,32 @@ impl YoloTrainerApp {
                                                 Vec2::splat(side),
                                                 Sense::hover(),
                                             );
+                                            let [tw, th] = tex.size();
+                                            let tw = tw as f32;
+                                            let th = th as f32;
+                                            let uv = if tw > 0.0 && th > 0.0 {
+                                                if tw >= th {
+                                                    let du = th / tw;
+                                                    let u0 = (1.0 - du) * 0.5;
+                                                    Rect::from_min_max(
+                                                        Pos2::new(u0, 0.0),
+                                                        Pos2::new(u0 + du, 1.0),
+                                                    )
+                                                } else {
+                                                    let dv = tw / th;
+                                                    let v0 = (1.0 - dv) * 0.5;
+                                                    Rect::from_min_max(
+                                                        Pos2::new(0.0, v0),
+                                                        Pos2::new(1.0, v0 + dv),
+                                                    )
+                                                }
+                                            } else {
+                                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+                                            };
                                             ui.painter().image(
                                                 tex.id(),
                                                 r,
-                                                Rect::from_min_max(
-                                                    Pos2::ZERO,
-                                                    Pos2::new(1.0, 1.0),
-                                                ),
+                                                uv,
                                                 Color32::WHITE,
                                             );
                                         });
@@ -8649,8 +8675,13 @@ impl eframe::App for YoloTrainerApp {
         }
         self.rebuild_annotated_strip_if_dirty();
         if !self.conda_env_list_bootstrapped {
-            self.refresh_conda_env_list();
-            self.conda_env_list_bootstrapped = true;
+            if !self.conda_bootstrap_painted_once {
+                self.conda_bootstrap_painted_once = true;
+                ctx.request_repaint();
+            } else {
+                self.refresh_conda_env_list();
+                self.conda_env_list_bootstrapped = true;
+            }
         }
 
         // 不得在 `ctx.input` 闭包内再调用 `ctx.memory` / `ctx.input`，否则会死锁（egui 文档）。
