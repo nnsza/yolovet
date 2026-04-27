@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod onnx_assist;
 
@@ -120,6 +120,64 @@ fn status_chip(ui: &mut Ui, text: &str, tint: Color32) {
         });
 }
 
+fn status_bar_sized(ui: &mut Ui, width: f32, text: &str, tint: Color32) {
+    let outer_w = width.max(1.0);
+    let outer_h = 40.0_f32;
+    let inner_w = (outer_w - 26.0).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(outer_w, outer_h), Sense::hover());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    Frame::default()
+        .fill(color_alpha(tint, 28))
+        .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+        .rounding(egui::Rounding::same(12.0))
+        .stroke(Stroke::new(1.0, color_alpha(tint, 120)))
+        .show(&mut child, |ui| {
+            ui.set_min_size(Vec2::new(inner_w, outer_h - 14.0));
+            ui.with_layout(
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(text).small().strong().color(tint))
+                            .truncate(),
+                    );
+                },
+            );
+        });
+}
+
+fn slim_status_bar(ui: &mut Ui, text: &str, tint: Color32) {
+    let outer_w = ui.available_width().max(1.0);
+    let outer_h = 28.0_f32;
+    let inner_w = (outer_w - 18.0).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(outer_w, outer_h), Sense::hover());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    Frame::default()
+        .fill(color_alpha(tint, 24))
+        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+        .rounding(egui::Rounding::same(10.0))
+        .stroke(Stroke::new(1.0, color_alpha(tint, 112)))
+        .show(&mut child, |ui| {
+            ui.set_min_size(Vec2::new(inner_w, outer_h - 8.0));
+            ui.with_layout(
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(text).size(11.5).strong().color(tint))
+                            .truncate(),
+                    );
+                },
+            );
+        });
+}
+
 fn compact_metric_tile(ui: &mut Ui, width: f32, label: &str, value: &str, tint: Color32) {
     let w = width.max(1.0);
     Frame::default()
@@ -222,17 +280,19 @@ fn training_backend_card(
         egui::FontId::proportional(13.5),
         theme::TEXT,
     );
-    painter.text(
-        Pos2::new(draw_rect.left() + 24.0, draw_rect.bottom() - 12.0),
-        Align2::LEFT_CENTER,
-        subtitle,
-        egui::FontId::proportional(10.5),
-        if selected {
-            color_alpha(accent, 230)
-        } else {
-            theme::TEXT_MUTED
-        },
-    );
+    if !subtitle.trim().is_empty() {
+        painter.text(
+            Pos2::new(draw_rect.left() + 24.0, draw_rect.bottom() - 12.0),
+            Align2::LEFT_CENTER,
+            subtitle,
+            egui::FontId::proportional(10.5),
+            if selected {
+                color_alpha(accent, 230)
+            } else {
+                theme::TEXT_MUTED
+            },
+        );
+    }
 }
 
 fn section_accordion<R>(
@@ -5853,10 +5913,12 @@ impl YoloTrainerApp {
                         Color32::from_rgb(30, 38, 32),
                         theme::WARN,
                         |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                status_chip(ui, "数字单选 = 新框默认类", theme::ACCENT);
-                                status_chip(ui, "↑↓ 调整索引顺序", theme::WARN);
-                                status_chip(ui, "× 删除整类并可撤销", theme::DANGER);
+                            ui.vertical(|ui| {
+                                slim_status_bar(ui, "数字单选 = 新框默认类", theme::ACCENT);
+                                ui.add_space(4.0);
+                                slim_status_bar(ui, "↑↓ 调整索引顺序", theme::WARN);
+                                ui.add_space(4.0);
+                                slim_status_bar(ui, "× 删除整类并可撤销", theme::DANGER);
                             });
                             ui.add_space(8.0);
 
@@ -6031,8 +6093,8 @@ impl YoloTrainerApp {
                                     builtin_rect,
                                     &builtin_resp,
                                     builtin_id,
-                                    "自带 CPU",
-                                    "内置训练器 + 自动转 ONNX",
+                                    "内置 CPU 训练",
+                                    "",
                                     theme::OK,
                                     self.use_builtin_cpu_train,
                                 );
@@ -6042,7 +6104,7 @@ impl YoloTrainerApp {
                                     &conda_resp,
                                     conda_id,
                                     "Conda 环境",
-                                    "填写环境根目录并调用 python.exe",
+                                    "",
                                     theme::ACCENT,
                                     !self.use_builtin_cpu_train,
                                 );
@@ -6062,16 +6124,13 @@ impl YoloTrainerApp {
                                     // 与「训练方式 / 预训练权重」等侧栏定宽区贴合：仅内容时 Frame 会缩窄，需占满可用列宽
                                     let full_w = ui.available_width().max(1.0);
                                     ui.set_min_width(full_w);
-                                    ui.label(
-                                        RichText::new("内置组件状态")
-                                            .small()
-                                            .strong()
-                                            .color(theme::TEXT),
-                                    );
-                                    ui.add_space(8.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        status_chip(
+                                    let gap = 6.0_f32;
+                                    let item_w = ((full_w - gap) * 0.5).max(1.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = gap;
+                                        status_bar_sized(
                                             ui,
+                                            item_w,
                                             if train_ready {
                                                 "CPU 训练器已就绪"
                                             } else {
@@ -6079,8 +6138,9 @@ impl YoloTrainerApp {
                                             },
                                             if train_ready { theme::OK } else { theme::DANGER },
                                         );
-                                        status_chip(
+                                        status_bar_sized(
                                             ui,
+                                            item_w,
                                             if export_ready {
                                                 "ONNX 转码器已就绪"
                                             } else {
@@ -6093,31 +6153,12 @@ impl YoloTrainerApp {
                             } else {
                                 app_card(theme::SURFACE_SOFT).show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new("Conda 环境根目录")
-                                                .small()
-                                                .strong()
-                                                .color(theme::TEXT),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.small_button("刷新列表").clicked() {
-                                                    self.refresh_conda_env_list();
-                                                }
-                                            },
-                                        );
+                                        if ui.small_button("刷新列表").clicked() {
+                                            self.refresh_conda_env_list();
+                                        }
                                     });
                                     ui.add_space(8.0);
-                                    if self.conda_env_paths.is_empty() {
-                                        ui.label(
-                                            RichText::new(
-                                                "未检测到 Conda，下面可直接填写环境根目录；目录内需要有 python.exe。",
-                                            )
-                                            .small()
-                                            .color(theme::TEXT_MUTED),
-                                        );
-                                    } else {
+                                    if !self.conda_env_paths.is_empty() {
                                         self.conda_env_idx = self
                                             .conda_env_idx
                                             .min(self.conda_env_paths.len().saturating_sub(1));
@@ -6136,12 +6177,6 @@ impl YoloTrainerApp {
                                                 self.conda_env_custom_root = path.clone();
                                             }
                                         }
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new("也可以直接填写路径")
-                                                .small()
-                                                .color(theme::TEXT_MUTED),
-                                        );
                                     }
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.conda_env_custom_root)
@@ -6169,19 +6204,6 @@ impl YoloTrainerApp {
                                             );
                                         }
                                     });
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "当前将使用：{}",
-                                            if resolved_root.trim().is_empty() {
-                                                "未设置".to_string()
-                                            } else {
-                                                resolved_root
-                                            }
-                                        ))
-                                        .small()
-                                        .color(theme::TEXT_MUTED),
-                                    );
                                 });
                             }
 
@@ -7928,7 +7950,7 @@ impl YoloTrainerApp {
         let total_w = ui.available_width();
         // 全图总览卡片最大宽度（靠右对齐；右缘与下方标注画布右缘对齐，画布矩形来自上一帧）
         let overview_panel_max_w = 240.0;
-        let left_target = self.sidebar_width.clamp(280.0, 500.0);
+        let left_target = self.sidebar_width.clamp(316.0, 500.0);
         let left_w = left_target.min((total_w - gap - overview_panel_max_w).max(240.0));
 
         Frame::default()
@@ -7978,15 +8000,9 @@ impl YoloTrainerApp {
                                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 0.0);
                                 if let Some(tex) = &self.top_bar_logo {
                                     // 左上展示行内，为 YoloVet+分隔+状态芯片保留宽度，徽标为内接**最大**正方形
-                                    const RESERVE_NAME_CHIP: f32 = 255.0;
-                                    const HAIR_GUT: f32 = 16.0;
-                                    const ROW_PAD: f32 = 8.0;
                                     let row = ui.max_rect();
-                                    let h_lim = (row.height() * 0.95).max(1.0);
-                                    let w_lim = (row.width() - RESERVE_NAME_CHIP - HAIR_GUT - ROW_PAD)
-                                        .max(1.0);
-                                    // 取当前可用区域内接的最大正方形；只保最小下限，不再额外压小。
-                                    let side = h_lim.min(w_lim).max(24.0);
+                                    // 仅跟随顶部行高，不跟随左栏拖窄一起缩小。
+                                    let side = (row.height() - 4.0).clamp(96.0, 132.0);
                                     let logo_outer = side;
                                     Frame::none()
                                         .fill(theme::SURFACE_DEEP)
@@ -8811,8 +8827,8 @@ impl eframe::App for YoloTrainerApp {
 
         egui::SidePanel::left("left")
             .resizable(true)
-            .default_width(324.0)
-            .min_width(280.0)
+            .default_width(336.0)
+            .min_width(316.0)
             .max_width(500.0)
             .frame(Frame::none().fill(theme::SURFACE_DEEP))
             .show(ctx, |ui| {
